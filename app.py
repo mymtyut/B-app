@@ -146,9 +146,16 @@ def load_data():
         {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
-    # 日付型の変換
+    
+    # --- 型変換処理 (重要) ---
+    # 日付変換
     df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
     df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
+    
+    # 数値変換 (契約時間を強制的にfloatにする)
+    # これがないとスプレッドシートの文字データとして扱われ、入力ロックされる
+    df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
+    
     data["staff"] = df_staff
 
     # 3. 勤務区分
@@ -401,6 +408,7 @@ with tab2:
         "職種(副)": st.column_config.SelectboxColumn("職種(副)", options=job_options, required=False),
         "雇用形態": st.column_config.SelectboxColumn("雇用形態", options=["常勤", "非常勤"], required=True),
         "基本シフト": st.column_config.SelectboxColumn("基本シフト", options=shift_codes, required=True),
+        # 【修正】step=0.5を追加して0.5単位入力を可能に
         "契約時間(週)": st.column_config.NumberColumn("契約時間(週)", format="%.1f h", step=0.5),
         "入社日": st.column_config.DateColumn("入社日", required=True),
         "退職日": st.column_config.DateColumn("退職日"),
@@ -505,7 +513,7 @@ with tab3:
             if role not in exclude_roles:
                 week_hours = staff["契約時間(週)"]
                 
-                # 【修正点】文字列のfloat変換をtry-exceptで安全に行う
+                # 安全にfloat変換
                 try:
                     week_hours = float(week_hours)
                 except (ValueError, TypeError):
@@ -514,7 +522,6 @@ with tab3:
                 fte = week_hours / fulltime_weekly_hours
                 if fte > 1.0: fte = 1.0
                 actual_fte += fte
-                
         actual_fte = round(actual_fte, 1)
         st.metric("配置可能人員", f"{actual_fte} 人")
         if actual_fte >= required_staff: st.success("✅ 充足")
