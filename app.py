@@ -13,10 +13,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 1. Google Sheets 接続設定
 # ==========================================
 
-# Streamlit Secretsから認証情報を取得して接続する関数
 @st.cache_resource
 def get_gspread_client():
-    # Secretsから認証情報を辞書として取得
     key_dict = st.secrets["gcp_service_account"]
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
@@ -25,15 +23,12 @@ def get_gspread_client():
 
 def get_spreadsheet():
     client = get_gspread_client()
-    # Secretsに保存したシートのURLまたはキーを使って開く
-    # secrets.tomlの設定例: [spreadsheet] url = "..."
     sheet_url = st.secrets["spreadsheet"]["url"]
     return client.open_by_url(sheet_url)
 
 # --- データの読み書き関数 ---
 
 def load_data_from_sheet(worksheet_name, default_df=None):
-    """スプレッドシートの指定シートからDataFrameを読み込む"""
     sh = get_spreadsheet()
     try:
         worksheet = sh.worksheet(worksheet_name)
@@ -42,35 +37,28 @@ def load_data_from_sheet(worksheet_name, default_df=None):
             return default_df
         return pd.DataFrame(data)
     except gspread.WorksheetNotFound:
-        # シートがない場合は作成してデフォルト値を入れる
         if default_df is not None:
             worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
-            # ヘッダーとデータを入れる
             save_data_to_sheet(worksheet_name, default_df)
             return default_df
         return pd.DataFrame()
 
 def save_data_to_sheet(worksheet_name, df):
-    """DataFrameをスプレッドシートの指定シートに保存する"""
     sh = get_spreadsheet()
     try:
         worksheet = sh.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
         worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
     
-    # データをクリアして書き込み
     worksheet.clear()
-    # set_with_dataframeはgspread-dataframeが必要だが、
-    # ここでは依存を増やさないよう基本機能で実装
     params = [df.columns.values.tolist()] + df.values.tolist()
-    # 日付型などが含まれるとJSONエラーになることがあるため文字列化
     clean_params = []
     for row in params:
         clean_row = []
         for cell in row:
             if isinstance(cell, (datetime.date, datetime.datetime, datetime.time)):
                 clean_row.append(str(cell))
-            elif pd.isna(cell): # NaN対策
+            elif pd.isna(cell):
                 clean_row.append("")
             else:
                 clean_row.append(cell)
@@ -79,7 +67,6 @@ def save_data_to_sheet(worksheet_name, df):
     worksheet.update(clean_params)
 
 # --- 設定値のJSON変換保存 ---
-# スプレッドシートは表形式なので、設定JSONは「settings」シートのA1セルに文字列として保存する
 def load_settings_from_sheet():
     sh = get_spreadsheet()
     try:
@@ -87,7 +74,6 @@ def load_settings_from_sheet():
         val = ws.acell('A1').value
         if val:
             settings = json.loads(val)
-            # 日付型の復元
             settings["opening_date"] = datetime.datetime.strptime(settings["opening_date"], "%Y-%m-%d").date()
             settings["open_time"] = datetime.datetime.strptime(settings["open_time"], "%H:%M:%S").time()
             settings["close_time"] = datetime.datetime.strptime(settings["close_time"], "%H:%M:%S").time()
@@ -117,7 +103,7 @@ def save_settings_to_sheet(settings_dict):
     ws.update_acell('A1', json_str)
 
 # ==========================================
-# 2. アプリ共通設定 (以下、ロジック部分は変更なし)
+# 2. アプリ共通設定
 # ==========================================
 
 DEFAULT_SETTINGS = {
@@ -146,13 +132,10 @@ def ceil_decimal_1(value):
     return math.ceil(value * 10) / 10
 
 def load_data():
-    """全データをスプレッドシートから読み込む"""
     data = {}
-    
-    # 1. 設定
     data["settings"] = load_settings_from_sheet()
 
-    # 2. スタッフ
+    # スタッフ
     default_staff = pd.DataFrame([
         {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
         {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
@@ -160,12 +143,11 @@ def load_data():
         {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
-    # 日付型の変換
     df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
     df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
     data["staff"] = df_staff
 
-    # 3. 勤務区分
+    # 勤務区分
     default_patterns = pd.DataFrame([
         {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
         {"コード": "B", "名称": "日勤B", "開始": "09:00:00", "終了": "17:00:00", "休憩(分)": 60},
@@ -177,22 +159,21 @@ def load_data():
     df_ptn["終了"] = pd.to_datetime(df_ptn["終了"], format='%H:%M:%S').dt.time
     data["patterns"] = df_ptn
 
-    # 4. 休日
+    # 休日
     default_holidays = pd.DataFrame([
         {"名称": "年末年始", "開始月": 12, "開始日": 29, "終了月": 1, "終了日": 3},
         {"名称": "夏季休暇", "開始月": 8,  "開始日": 13, "終了月": 8, "終了日": 15},
     ])
     data["holidays"] = load_data_from_sheet("holidays", default_holidays)
 
-    # 5. 実績
+    # 実績
     default_records = pd.DataFrame(columns=["年月", "延べ利用者数", "開所日数"])
     data["records"] = load_data_from_sheet("monthly_records", default_records)
 
-    # 6. ドラフトシフト
-    # 列定義がないと空のDFが作成されてエラーになる場合があるので列指定
+    # ドラフトシフト
     data["draft_shift"] = load_data_from_sheet("current_shift_draft", pd.DataFrame())
     if data["draft_shift"].empty:
-        data["draft_shift"] = None # None扱いにする
+        data["draft_shift"] = None 
 
     return data
 
@@ -277,7 +258,6 @@ def calculate_average_users_detail(target_date, opening_date, capacity, records_
         return explanation
 
     df_recs = records_df.copy()
-    # 文字列変換でエラーが出ないよう型変換
     df_recs["date"] = pd.to_datetime(df_recs["年月"].astype(str).str.replace("年", "-").str.replace("月", "-01"))
     df_recs["dt_date"] = df_recs["date"].dt.date
     
@@ -417,7 +397,8 @@ with tab2:
         "職種(副)": st.column_config.SelectboxColumn("職種(副)", options=job_options, required=False),
         "雇用形態": st.column_config.SelectboxColumn("雇用形態", options=["常勤", "非常勤"], required=True),
         "基本シフト": st.column_config.SelectboxColumn("基本シフト", options=shift_codes, required=True),
-        "契約時間(週)": st.column_config.NumberColumn("契約時間(週)", format="%.1f h"),
+        # 【修正箇所】step=0.5を追加しました
+        "契約時間(週)": st.column_config.NumberColumn("契約時間(週)", format="%.1f h", step=0.5),
         "入社日": st.column_config.DateColumn("入社日", required=True),
         "退職日": st.column_config.DateColumn("退職日"),
     }
