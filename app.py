@@ -132,10 +132,13 @@ def ceil_decimal_1(value):
     return math.ceil(value * 10) / 10
 
 def load_data():
+    """全データをスプレッドシートから読み込む"""
     data = {}
+    
+    # 1. 設定
     data["settings"] = load_settings_from_sheet()
 
-    # スタッフ
+    # 2. スタッフ
     default_staff = pd.DataFrame([
         {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
         {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
@@ -143,11 +146,12 @@ def load_data():
         {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
+    # 日付型の変換
     df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
     df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
     data["staff"] = df_staff
 
-    # 勤務区分
+    # 3. 勤務区分
     default_patterns = pd.DataFrame([
         {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
         {"コード": "B", "名称": "日勤B", "開始": "09:00:00", "終了": "17:00:00", "休憩(分)": 60},
@@ -159,18 +163,18 @@ def load_data():
     df_ptn["終了"] = pd.to_datetime(df_ptn["終了"], format='%H:%M:%S').dt.time
     data["patterns"] = df_ptn
 
-    # 休日
+    # 4. 休日
     default_holidays = pd.DataFrame([
         {"名称": "年末年始", "開始月": 12, "開始日": 29, "終了月": 1, "終了日": 3},
         {"名称": "夏季休暇", "開始月": 8,  "開始日": 13, "終了月": 8, "終了日": 15},
     ])
     data["holidays"] = load_data_from_sheet("holidays", default_holidays)
 
-    # 実績
+    # 5. 実績
     default_records = pd.DataFrame(columns=["年月", "延べ利用者数", "開所日数"])
     data["records"] = load_data_from_sheet("monthly_records", default_records)
 
-    # ドラフトシフト
+    # 6. ドラフトシフト
     data["draft_shift"] = load_data_from_sheet("current_shift_draft", pd.DataFrame())
     if data["draft_shift"].empty:
         data["draft_shift"] = None 
@@ -397,7 +401,6 @@ with tab2:
         "職種(副)": st.column_config.SelectboxColumn("職種(副)", options=job_options, required=False),
         "雇用形態": st.column_config.SelectboxColumn("雇用形態", options=["常勤", "非常勤"], required=True),
         "基本シフト": st.column_config.SelectboxColumn("基本シフト", options=shift_codes, required=True),
-        # 【修正箇所】step=0.5を追加しました
         "契約時間(週)": st.column_config.NumberColumn("契約時間(週)", format="%.1f h", step=0.5),
         "入社日": st.column_config.DateColumn("入社日", required=True),
         "退職日": st.column_config.DateColumn("退職日"),
@@ -501,10 +504,17 @@ with tab3:
             role = staff["職種(主)"]
             if role not in exclude_roles:
                 week_hours = staff["契約時間(週)"]
-                if pd.isna(week_hours): week_hours = 0
+                
+                # 【修正点】文字列のfloat変換をtry-exceptで安全に行う
+                try:
+                    week_hours = float(week_hours)
+                except (ValueError, TypeError):
+                    week_hours = 0.0
+                
                 fte = week_hours / fulltime_weekly_hours
                 if fte > 1.0: fte = 1.0
                 actual_fte += fte
+                
         actual_fte = round(actual_fte, 1)
         st.metric("配置可能人員", f"{actual_fte} 人")
         if actual_fte >= required_staff: st.success("✅ 充足")
