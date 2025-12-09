@@ -4,25 +4,121 @@ import jpholiday
 import math
 import datetime
 import calendar
-import os
 import json
 from dateutil.relativedelta import relativedelta
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # ==========================================
-# 1. 保存・読み込み用設定と関数
+# 1. Google Sheets 接続設定
 # ==========================================
-DATA_DIR = "./data"
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
 
-FILES = {
-    "staff": os.path.join(DATA_DIR, "staff_master.csv"),
-    "patterns": os.path.join(DATA_DIR, "shift_patterns.csv"),
-    "holidays": os.path.join(DATA_DIR, "holidays_recurring.csv"),
-    "records": os.path.join(DATA_DIR, "monthly_records.csv"),
-    "settings": os.path.join(DATA_DIR, "settings.json"),
-    "draft_shift": os.path.join(DATA_DIR, "current_shift_draft.csv")
-}
+# Streamlit Secretsから認証情報を取得して接続する関数
+@st.cache_resource
+def get_gspread_client():
+    # Secretsから認証情報を辞書として取得
+    key_dict = st.secrets["gcp_service_account"]
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+    client = gspread.authorize(creds)
+    return client
+
+def get_spreadsheet():
+    client = get_gspread_client()
+    # Secretsに保存したシートのURLまたはキーを使って開く
+    # secrets.tomlの設定例: [spreadsheet] url = "..."
+    sheet_url = st.secrets["spreadsheet"]["url"]
+    return client.open_by_url(sheet_url)
+
+# --- データの読み書き関数 ---
+
+def load_data_from_sheet(worksheet_name, default_df=None):
+    """スプレッドシートの指定シートからDataFrameを読み込む"""
+    sh = get_spreadsheet()
+    try:
+        worksheet = sh.worksheet(worksheet_name)
+        data = worksheet.get_all_records()
+        if not data and default_df is not None:
+            return default_df
+        return pd.DataFrame(data)
+    except gspread.WorksheetNotFound:
+        # シートがない場合は作成してデフォルト値を入れる
+        if default_df is not None:
+            worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
+            # ヘッダーとデータを入れる
+            save_data_to_sheet(worksheet_name, default_df)
+            return default_df
+        return pd.DataFrame()
+
+def save_data_to_sheet(worksheet_name, df):
+    """DataFrameをスプレッドシートの指定シートに保存する"""
+    sh = get_spreadsheet()
+    try:
+        worksheet = sh.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
+    
+    # データをクリアして書き込み
+    worksheet.clear()
+    # set_with_dataframeはgspread-dataframeが必要だが、
+    # ここでは依存を増やさないよう基本機能で実装
+    params = [df.columns.values.tolist()] + df.values.tolist()
+    # 日付型などが含まれるとJSONエラーになることがあるため文字列化
+    clean_params = []
+    for row in params:
+        clean_row = []
+        for cell in row:
+            if isinstance(cell, (datetime.date, datetime.datetime, datetime.time)):
+                clean_row.append(str(cell))
+            elif pd.isna(cell): # NaN対策
+                clean_row.append("")
+            else:
+                clean_row.append(cell)
+        clean_params.append(clean_row)
+        
+    worksheet.update(clean_params)
+
+# --- 設定値のJSON変換保存 ---
+# スプレッドシートは表形式なので、設定JSONは「settings」シートのA1セルに文字列として保存する
+def load_settings_from_sheet():
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet("settings")
+        val = ws.acell('A1').value
+        if val:
+            settings = json.loads(val)
+            # 日付型の復元
+            settings["opening_date"] = datetime.datetime.strptime(settings["opening_date"], "%Y-%m-%d").date()
+            settings["open_time"] = datetime.datetime.strptime(settings["open_time"], "%H:%M:%S").time()
+            settings["close_time"] = datetime.datetime.strptime(settings["close_time"], "%H:%M:%S").time()
+            if "service_ratio" not in settings: settings["service_ratio"] = 6.0 
+            return settings
+    except (gspread.WorksheetNotFound, json.JSONDecodeError, TypeError):
+        pass
+    return _get_default_settings_obj()
+
+def save_settings_to_sheet(settings_dict):
+    s_save = settings_dict.copy()
+    if isinstance(s_save["opening_date"], datetime.date):
+        s_save["opening_date"] = s_save["opening_date"].strftime("%Y-%m-%d")
+    if isinstance(s_save["open_time"], datetime.time):
+        s_save["open_time"] = s_save["open_time"].strftime("%H:%M:%S")
+    if isinstance(s_save["close_time"], datetime.time):
+        s_save["close_time"] = s_save["close_time"].strftime("%H:%M:%S")
+    
+    json_str = json.dumps(s_save, ensure_ascii=False)
+    
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet("settings")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="settings", rows=10, cols=10)
+    
+    ws.update_acell('A1', json_str)
+
+# ==========================================
+# 2. アプリ共通設定 (以下、ロジック部分は変更なし)
+# ==========================================
 
 DEFAULT_SETTINGS = {
     "facility_name": "就労支援センター 未来",
@@ -39,24 +135,6 @@ DEFAULT_SETTINGS = {
 
 RATIO_MAP = {6.0: "6:1", 7.5: "7.5:1", 10.0: "10:1"}
 
-def ceil_decimal_1(value):
-    return math.ceil(value * 10) / 10
-
-def load_settings():
-    if os.path.exists(FILES["settings"]):
-        try:
-            with open(FILES["settings"], 'r', encoding='utf-8') as f:
-                settings = json.load(f)
-            settings["opening_date"] = datetime.datetime.strptime(settings["opening_date"], "%Y-%m-%d").date()
-            settings["open_time"] = datetime.datetime.strptime(settings["open_time"], "%H:%M:%S").time()
-            settings["close_time"] = datetime.datetime.strptime(settings["close_time"], "%H:%M:%S").time()
-            if "service_ratio" not in settings: settings["service_ratio"] = 6.0 
-            return settings
-        except Exception:
-            return _get_default_settings_obj()
-    else:
-        return _get_default_settings_obj()
-
 def _get_default_settings_obj():
     s = DEFAULT_SETTINGS.copy()
     s["opening_date"] = datetime.datetime.strptime(s["opening_date"], "%Y-%m-%d").date()
@@ -64,86 +142,76 @@ def _get_default_settings_obj():
     s["close_time"] = datetime.datetime.strptime(s["close_time"], "%H:%M:%S").time()
     return s
 
-def save_settings(settings_dict):
-    s_save = settings_dict.copy()
-    if isinstance(s_save["opening_date"], datetime.date):
-        s_save["opening_date"] = s_save["opening_date"].strftime("%Y-%m-%d")
-    if isinstance(s_save["open_time"], datetime.time):
-        s_save["open_time"] = s_save["open_time"].strftime("%H:%M:%S")
-    if isinstance(s_save["close_time"], datetime.time):
-        s_save["close_time"] = s_save["close_time"].strftime("%H:%M:%S")
-    
-    with open(FILES["settings"], 'w', encoding='utf-8') as f:
-        json.dump(s_save, f, ensure_ascii=False, indent=4)
+def ceil_decimal_1(value):
+    return math.ceil(value * 10) / 10
 
 def load_data():
+    """全データをスプレッドシートから読み込む"""
     data = {}
-    data["settings"] = load_settings()
+    
+    # 1. 設定
+    data["settings"] = load_settings_from_sheet()
 
-    if os.path.exists(FILES["staff"]):
-        df = pd.read_csv(FILES["staff"], encoding='utf-8-sig')
-        df["入社日"] = pd.to_datetime(df["入社日"]).dt.date
-        df["退職日"] = pd.to_datetime(df["退職日"]).dt.date
-        data["staff"] = df
-    else:
-        data["staff"] = pd.DataFrame([
-            {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": datetime.date(2024,4,1), "退職日": None},
-            {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": datetime.date(2024,4,1), "退職日": None},
-            {"名前": "指導員C", "職種(主)": "職業指導員", "職種(副)": "運転手", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "日,月", "入社日": datetime.date(2024,4,1), "退職日": None},
-            {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": datetime.date(2024,4,1), "退職日": None},
-        ])
+    # 2. スタッフ
+    default_staff = pd.DataFrame([
+        {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "指導員C", "職種(主)": "職業指導員", "職種(副)": "運転手", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "日,月", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
+    ])
+    df_staff = load_data_from_sheet("staff_master", default_staff)
+    # 日付型の変換
+    df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
+    df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
+    data["staff"] = df_staff
 
-    if os.path.exists(FILES["patterns"]):
-        df = pd.read_csv(FILES["patterns"], encoding='utf-8-sig')
-        df["開始"] = pd.to_datetime(df["開始"], format='%H:%M:%S').dt.time
-        df["終了"] = pd.to_datetime(df["終了"], format='%H:%M:%S').dt.time
-        data["patterns"] = df
-    else:
-        data["patterns"] = pd.DataFrame([
-            {"コード": "A", "名称": "日勤A", "開始": datetime.time(9,0), "終了": datetime.time(16,0), "休憩(分)": 60},
-            {"コード": "B", "名称": "日勤B", "開始": datetime.time(9,0), "終了": datetime.time(17,0), "休憩(分)": 60},
-            {"コード": "早", "名称": "早番",  "開始": datetime.time(8,30), "終了": datetime.time(16,30), "休憩(分)": 60},
-            {"コード": "午", "名称": "午前",  "開始": datetime.time(9,0), "終了": datetime.time(13,0), "休憩(分)": 0},
-        ])
+    # 3. 勤務区分
+    default_patterns = pd.DataFrame([
+        {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
+        {"コード": "B", "名称": "日勤B", "開始": "09:00:00", "終了": "17:00:00", "休憩(分)": 60},
+        {"コード": "早", "名称": "早番",  "開始": "08:30:00", "終了": "16:30:00", "休憩(分)": 60},
+        {"コード": "午", "名称": "午前",  "開始": "09:00:00", "終了": "13:00:00", "休憩(分)": 0},
+    ])
+    df_ptn = load_data_from_sheet("shift_patterns", default_patterns)
+    df_ptn["開始"] = pd.to_datetime(df_ptn["開始"], format='%H:%M:%S').dt.time
+    df_ptn["終了"] = pd.to_datetime(df_ptn["終了"], format='%H:%M:%S').dt.time
+    data["patterns"] = df_ptn
 
-    if os.path.exists(FILES["holidays"]):
-        data["holidays"] = pd.read_csv(FILES["holidays"], encoding='utf-8-sig')
-    else:
-        data["holidays"] = pd.DataFrame([
-            {"名称": "年末年始", "開始月": 12, "開始日": 29, "終了月": 1, "終了日": 3},
-            {"名称": "夏季休暇", "開始月": 8,  "開始日": 13, "終了月": 8, "終了日": 15},
-        ])
-        
-    if os.path.exists(FILES["records"]):
-        data["records"] = pd.read_csv(FILES["records"], encoding='utf-8-sig')
-    else:
-        data["records"] = pd.DataFrame(columns=["年月", "延べ利用者数", "開所日数"])
+    # 4. 休日
+    default_holidays = pd.DataFrame([
+        {"名称": "年末年始", "開始月": 12, "開始日": 29, "終了月": 1, "終了日": 3},
+        {"名称": "夏季休暇", "開始月": 8,  "開始日": 13, "終了月": 8, "終了日": 15},
+    ])
+    data["holidays"] = load_data_from_sheet("holidays", default_holidays)
 
-    if os.path.exists(FILES["draft_shift"]):
-        data["draft_shift"] = pd.read_csv(FILES["draft_shift"], encoding='utf-8-sig')
-    else:
-        data["draft_shift"] = None
-        
+    # 5. 実績
+    default_records = pd.DataFrame(columns=["年月", "延べ利用者数", "開所日数"])
+    data["records"] = load_data_from_sheet("monthly_records", default_records)
+
+    # 6. ドラフトシフト
+    # 列定義がないと空のDFが作成されてエラーになる場合があるので列指定
+    data["draft_shift"] = load_data_from_sheet("current_shift_draft", pd.DataFrame())
+    if data["draft_shift"].empty:
+        data["draft_shift"] = None # None扱いにする
+
     return data
 
-def save_csv_data(key, df):
-    df.to_csv(FILES[key], index=False, encoding='utf-8-sig')
-
 # ==========================================
-# 2. アプリケーション初期化
+# 3. アプリケーション本体
 # ==========================================
 
-st.set_page_config(page_title="就労B型 管理システム Ver12", layout="wide")
+st.set_page_config(page_title="就労B型 管理システム (Cloud版)", layout="wide")
 
 if 'data_loaded' not in st.session_state:
-    data = load_data()
-    st.session_state.settings = data["settings"]
-    st.session_state.staff_db = data["staff"]
-    st.session_state.shift_patterns = data["patterns"]
-    st.session_state.special_holidays_list = data["holidays"]
-    st.session_state.monthly_records = data["records"]
-    st.session_state.current_shift_df = data["draft_shift"]
-    st.session_state.data_loaded = True
+    with st.spinner("スプレッドシートからデータを読み込んでいます..."):
+        data = load_data()
+        st.session_state.settings = data["settings"]
+        st.session_state.staff_db = data["staff"]
+        st.session_state.shift_patterns = data["patterns"]
+        st.session_state.special_holidays_list = data["holidays"]
+        st.session_state.monthly_records = data["records"]
+        st.session_state.current_shift_df = data["draft_shift"]
+        st.session_state.data_loaded = True
 
 # --- ヘルパー関数 ---
 def is_special_holiday_recurring(target_date, holiday_df):
@@ -209,6 +277,7 @@ def calculate_average_users_detail(target_date, opening_date, capacity, records_
         return explanation
 
     df_recs = records_df.copy()
+    # 文字列変換でエラーが出ないよう型変換
     df_recs["date"] = pd.to_datetime(df_recs["年月"].astype(str).str.replace("年", "-").str.replace("月", "-01"))
     df_recs["dt_date"] = df_recs["date"].dt.date
     
@@ -290,9 +359,9 @@ with st.sidebar.form("settings_form"):
             "service_ratio": s_ratio_val
         }
         st.session_state.settings = new_settings
-        save_settings(new_settings)
-        st.success("設定を保存しました")
-        st.rerun() # ★ここにもrerunを追加して設定変更を即反映
+        save_settings_to_sheet(new_settings)
+        st.success("設定をクラウドに保存しました")
+        st.rerun()
 
 # 変数展開
 add_ons = st.session_state.settings["add_ons"]
@@ -305,7 +374,7 @@ service_ratio = st.session_state.settings.get("service_ratio", 6.0)
 tab1, tab2, tab3, tab4 = st.tabs(["🛠️ マスタ・休暇", "👥 従業員マスタ", "📅 実績・人員計算", "📝 シフト作成"])
 
 # ------------------------------------------
-# TAB 1: マスタ・休暇 (保存ボタンにrerun追加)
+# TAB 1: マスタ・休暇
 # ------------------------------------------
 with tab1:
     col_m1, col_m2 = st.columns(2)
@@ -314,9 +383,9 @@ with tab1:
         edited_patterns = st.data_editor(st.session_state.shift_patterns, num_rows="dynamic", use_container_width=True, key="pattern_editor")
         if st.button("勤務区分を保存"):
             st.session_state.shift_patterns = edited_patterns
-            save_csv_data("patterns", edited_patterns)
-            st.success("勤務区分を保存しました")
-            st.rerun() # ★リセット
+            save_data_to_sheet("shift_patterns", edited_patterns)
+            st.success("勤務区分をクラウドに保存しました")
+            st.rerun()
 
     with col_m2:
         st.subheader("2. 毎年繰り返す特別休暇")
@@ -328,16 +397,14 @@ with tab1:
             "終了日": st.column_config.NumberColumn("終了日", min_value=1, max_value=31),
         }
         edited_holidays = st.data_editor(st.session_state.special_holidays_list, column_config=column_config_holiday, num_rows="dynamic", use_container_width=True, key="holiday_editor_rec")
-        
-        # 【修正箇所】保存後にst.rerun()を実行して、強制的に画面を更新する
         if st.button("特別休暇を保存"):
             st.session_state.special_holidays_list = edited_holidays
-            save_csv_data("holidays", edited_holidays)
-            st.success("特別休暇を保存しました")
-            st.rerun() # ★これが重要です！
+            save_data_to_sheet("holidays", edited_holidays)
+            st.success("特別休暇をクラウドに保存しました")
+            st.rerun()
 
 # ------------------------------------------
-# TAB 2: 従業員マスタ (保存ボタンにrerun追加)
+# TAB 2: 従業員マスタ
 # ------------------------------------------
 with tab2:
     st.header("👥 従業員詳細設定")
@@ -362,9 +429,9 @@ with tab2:
         for idx, row in final_df.iterrows():
             if row["雇用形態"] == "常勤": final_df.at[idx, "契約時間(週)"] = fulltime_weekly_hours
         st.session_state.staff_db = final_df
-        save_csv_data("staff", final_df)
-        st.success("従業員データを保存しました")
-        st.rerun() # ★リセット
+        save_data_to_sheet("staff_master", final_df)
+        st.success("従業員データをクラウドに保存しました")
+        st.rerun()
 
 # ------------------------------------------
 # TAB 3: 実績・人員計算
@@ -402,9 +469,9 @@ with tab3:
             df_recs = df_recs[df_recs["年月"] != target_ym]
             new_row = {"年月": target_ym, "延べ利用者数": users_input, "開所日数": calc_open_days}
             st.session_state.monthly_records = pd.concat([df_recs, pd.DataFrame([new_row])], ignore_index=True)
-            save_csv_data("records", st.session_state.monthly_records)
-            st.success(f"{target_ym} の実績を保存しました")
-            st.rerun() # ★リセット
+            save_data_to_sheet("monthly_records", st.session_state.monthly_records)
+            st.success(f"{target_ym} の実績をクラウドに保存しました")
+            st.rerun()
 
     st.divider()
 
@@ -476,19 +543,15 @@ with tab4:
         
     shift_month = datetime.date(s_year_shift, s_month_shift, 1)
     
-    # 対象スタッフ抽出
     shift_staff_df = get_active_staff_df(st.session_state.staff_db, add_ons, target_date_obj=shift_month)
     shift_staff_names = shift_staff_df["名前"].tolist()
     
-    # 勤務区分リスト
     shift_opts = st.session_state.shift_patterns["コード"].tolist() + ["休", "公休", "有給"]
     
-    # 日付列の生成
     start_dt = shift_month.replace(day=1)
     end_dt = start_dt + relativedelta(months=1) - datetime.timedelta(days=1)
     dates = pd.date_range(start_dt, end_dt)
     
-    # ヘッダー用日付リスト
     jp_days = ["月","火","水","木","金","土","日"]
     date_cols = []
     holiday_cols = [] 
@@ -496,7 +559,6 @@ with tab4:
     for d in dates:
         d_label = f"{d.day}({jp_days[d.weekday()]})"
         date_cols.append(d_label)
-        
         is_holiday = False
         wd_str = jp_days[d.weekday()]
         if wd_str in closed_days_select: is_holiday = True
@@ -504,88 +566,56 @@ with tab4:
         else:
             is_sp, _ = is_special_holiday_recurring(d.date(), st.session_state.special_holidays_list)
             if is_sp: is_holiday = True
-            
         if is_holiday:
             holiday_cols.append(d_label)
 
-    # --- ボタンアクション: 新規生成 ---
     if st.button("シフト案を新規自動生成", type="primary"):
         rows = []
         for _, staff in shift_staff_df.iterrows():
             s_name = staff["名前"]
             row_data = {"氏名": s_name}
-            
             for d in dates:
                 d_label = f"{d.day}({jp_days[d.weekday()]})"
                 wd_str = jp_days[d.weekday()]
-                
                 is_closed = False
                 if d_label in holiday_cols: is_closed = True
                 
-                if is_closed:
-                    row_data[d_label] = "休"
-                elif wd_str in staff["固定休"]:
-                    row_data[d_label] = "公休"
-                else:
-                    row_data[d_label] = staff["基本シフト"]
+                if is_closed: row_data[d_label] = "休"
+                elif wd_str in staff["固定休"]: row_data[d_label] = "公休"
+                else: row_data[d_label] = staff["基本シフト"]
             rows.append(row_data)
             
         new_df = pd.DataFrame(rows)
         st.session_state.current_shift_df = new_df
-        save_csv_data("draft_shift", new_df)
+        save_data_to_sheet("current_shift_draft", new_df)
         st.success("新規作成しました")
         st.rerun()
 
-    # --- 表示・編集 ---
     if st.session_state.current_shift_df is not None:
         current_df = st.session_state.current_shift_df
-        
-        # カラム設定
-        column_config = {
-            "氏名": st.column_config.TextColumn("氏名", disabled=True)
-        }
+        column_config = {"氏名": st.column_config.TextColumn("氏名", disabled=True)}
         for d_col in date_cols:
             if d_col in current_df.columns:
-                column_config[d_col] = st.column_config.SelectboxColumn(
-                    d_col, options=shift_opts, required=True, width="small"
-                )
+                column_config[d_col] = st.column_config.SelectboxColumn(d_col, options=shift_opts, required=True, width="small")
         
         display_cols = ["氏名"] + [c for c in date_cols if c in current_df.columns]
-        
         st.subheader(f"{s_year_shift}年{s_month_shift}月 シフト表")
         
-        edited_df = st.data_editor(
-            current_df[display_cols],
-            column_config=column_config,
-            use_container_width=True,
-            height=400,
-            hide_index=True,
-            key="shift_editor_h_key"
-        )
+        edited_df = st.data_editor(current_df[display_cols], column_config=column_config, use_container_width=True, height=400, hide_index=True, key="shift_editor_h_key")
         
         st.session_state.current_shift_df = edited_df
-        save_csv_data("draft_shift", edited_df)
+        save_data_to_sheet("current_shift_draft", edited_df)
         
-        # 色付き確認
         st.divider()
         st.subheader("👀 色付き確認")
-        
         def highlight_holidays_col(data):
             style_df = pd.DataFrame('', index=data.index, columns=data.columns)
             for col in holiday_cols:
-                if col in style_df.columns:
-                    style_df[col] = 'background-color: #ffe6e6; color: #cc0000'
+                if col in style_df.columns: style_df[col] = 'background-color: #ffe6e6; color: #cc0000'
             return style_df
 
-        st.dataframe(
-            edited_df.style.apply(highlight_holidays_col, axis=None), 
-            use_container_width=True, 
-            height=600, 
-            hide_index=True
-        )
-        
+        st.dataframe(edited_df.style.apply(highlight_holidays_col, axis=None), use_container_width=True, height=600, hide_index=True)
         csv_out = edited_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("シフト表をPCに保存 (CSV)", csv_out, "shift_h_final.csv", "text/csv")
-        
     else:
         st.info("まだシフト表がありません。「シフト案を新規自動生成」ボタンを押してください。")
