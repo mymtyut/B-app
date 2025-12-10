@@ -38,12 +38,13 @@ def load_data_from_sheet(worksheet_name, default_df=None):
         return pd.DataFrame(data)
     except gspread.WorksheetNotFound:
         if default_df is not None:
+            # 初期作成時は余裕を持って作成
             worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
             save_data_to_sheet(worksheet_name, default_df)
             return default_df
         return pd.DataFrame()
 
-# 【修正】保存処理を強化（Numpy型対策、API呼び出し修正）
+# 【重要修正】安全な保存関数 (全データ文字列化 & リサイズ)
 def save_data_to_sheet(worksheet_name, df):
     sh = get_spreadsheet()
     try:
@@ -51,31 +52,40 @@ def save_data_to_sheet(worksheet_name, df):
     except gspread.WorksheetNotFound:
         worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
     
-    worksheet.clear()
+    # データ準備
+    # ヘッダーと値をリスト化
+    headers = df.columns.values.tolist()
+    data_list = df.values.tolist()
+    all_values = [headers] + data_list
     
-    # データをリスト化
-    params = [df.columns.values.tolist()] + df.values.tolist()
+    # シートのサイズをデータに合わせてリサイズ (エラー回避のため)
+    num_rows = len(all_values)
+    num_cols = len(headers)
+    # 現在のサイズより大きい場合のみリサイズ、または強制リサイズ
+    # ここではシンプルにデータサイズに合わせてリサイズする
+    try:
+        worksheet.resize(rows=max(num_rows, 10), cols=max(num_cols, 5))
+    except Exception:
+        pass # リサイズ権限がない場合などは無視
     
+    # データのクリーニング（全データを文字列化してJSONエラーを防ぐ）
     clean_params = []
-    for row in params:
+    for row in all_values:
         clean_row = []
         for cell in row:
-            # 1. 日付型 -> 文字列
-            if isinstance(cell, (datetime.date, datetime.datetime, datetime.time)):
-                clean_row.append(str(cell))
-            # 2. 空値 (NaN, NaT, None) -> 空文字
-            elif pd.isna(cell):
+            # 空値 (NaN, NaT, None) -> 空文字
+            if pd.isna(cell):
                 clean_row.append("")
-            # 3. Numpy数値型 -> Python標準数値型 (int, float)
-            elif hasattr(cell, "item"): 
-                clean_row.append(cell.item())
-            # 4. その他 -> そのまま
+            # それ以外は強制的に文字列化
             else:
-                clean_row.append(cell)
+                clean_row.append(str(cell))
         clean_params.append(clean_row)
-        
-    # values引数を明示して更新
-    worksheet.update(values=clean_params)
+    
+    # データクリア
+    worksheet.clear()
+    
+    # 更新実行 (A1セルから)
+    worksheet.update(range_name='A1', values=clean_params)
 
 # --- 設定値のJSON変換保存 ---
 def load_settings_from_sheet():
@@ -219,14 +229,11 @@ def load_data():
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
     
-    # 型変換
     df_staff["入社日"] = df_staff["入社日"].apply(safe_to_date)
     df_staff["退職日"] = df_staff["退職日"].apply(safe_to_date)
-    
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
     if "兼務時間(週)" not in df_staff.columns: df_staff["兼務時間(週)"] = 0.0
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
-    
     data["staff"] = df_staff
 
     default_patterns = pd.DataFrame([
@@ -462,6 +469,7 @@ with tab1:
         current_list = st.session_state.settings.get(key, [])
         df_hist = pd.DataFrame(current_list)
         
+        # 安全な日付変換
         if "start" not in df_hist.columns: df_hist["start"] = pd.Series(dtype='datetime64[ns]')
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         
