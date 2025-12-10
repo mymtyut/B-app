@@ -10,7 +10,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ==========================================
-# 1. 関数定義エリア (すべてここに集約)
+# 1. 関数定義エリア
 # ==========================================
 
 # --- GSpread 接続 ---
@@ -350,16 +350,16 @@ def load_data():
 
     return data
 
+def reload_all_data():
+    if 'data_loaded' in st.session_state:
+        del st.session_state['data_loaded']
+    st.rerun()
+
 # ==========================================
 # 4. アプリケーション開始
 # ==========================================
 
 st.set_page_config(page_title="就労B型 管理システム (Cloud版)", layout="wide")
-
-def reload_all_data():
-    if 'data_loaded' in st.session_state:
-        del st.session_state['data_loaded']
-    st.rerun()
 
 if 'data_loaded' not in st.session_state:
     with st.spinner("スプレッドシートからデータを読み込んでいます..."):
@@ -375,39 +375,52 @@ if 'data_loaded' not in st.session_state:
 today = datetime.date.today()
 year_range = list(range(today.year - 2, today.year + 3))
 
-# --- サイドバー ---
+# --- サイドバー メニュー（ここが画面切り替えの肝です） ---
+st.sidebar.title("メニュー")
+menu = st.sidebar.radio(
+    "表示する画面を選択",
+    ["マスタ・休暇設定", "従業員マスタ", "実績・人員計算", "シフト作成"],
+    index=1 # デフォルトは従業員マスタ
+)
+
+st.sidebar.divider()
+
+# --- サイドバー 設定フォーム ---
 st.sidebar.header("⚙️ 事業所全体設定")
-st.sidebar.caption("変更後に「設定を保存」を押してください")
+with st.sidebar.expander("詳細設定を開く"):
+    with st.form("settings_form"):
+        st.subheader("基本情報")
+        s_fac_name = st.text_input("事業所名", value=st.session_state.settings["facility_name"])
+        s_open_date = st.date_input("開所年月日", value=st.session_state.settings["opening_date"])
+        s_capacity = st.number_input("定員数", value=st.session_state.settings["capacity"], step=1)
+        
+        st.subheader("体制・営業時間")
+        s_ratio_val = st.selectbox("配置基準", [6.0, 7.5, 10.0], index=[6.0, 7.5, 10.0].index(st.session_state.settings.get("service_ratio", 6.0)), format_func=lambda x: RATIO_MAP.get(x, f"{x}:1"))
+        s_open_time = st.time_input("営業開始", value=st.session_state.settings["open_time"])
+        s_close_time = st.time_input("営業終了", value=st.session_state.settings["close_time"])
+        s_fulltime = st.number_input("常勤時間(週)", value=st.session_state.settings["fulltime_hours"], step=0.5)
+        
+        st.subheader("取得加算")
+        s_addons = st.multiselect("取得中の加算", ["目標工賃達成指導員加算", "食事提供加算", "送迎加算"], default=st.session_state.settings["add_ons"])
+        
+        st.subheader("定休日設定")
+        s_closed_days = st.multiselect("曜日定休", ["月", "火", "水", "木", "金", "土", "日"], default=st.session_state.settings["closed_days"])
+        s_close_holiday = st.checkbox("祝日は休みにする", value=st.session_state.settings["close_on_holiday"])
+        
+        st.caption("※加算の取得期間設定は「マスタ・休暇設定」画面で行います")
 
-with st.sidebar.form("settings_form"):
-    st.subheader("基本情報")
-    s_fac_name = st.text_input("事業所名", value=st.session_state.settings["facility_name"])
-    s_open_date = st.date_input("開所年月日", value=st.session_state.settings["opening_date"])
-    s_capacity = st.number_input("定員数", value=st.session_state.settings["capacity"], step=1)
-    
-    st.subheader("体制・営業時間")
-    s_ratio_val = st.selectbox("配置基準", [6.0, 7.5, 10.0], index=[6.0, 7.5, 10.0].index(st.session_state.settings.get("service_ratio", 6.0)), format_func=lambda x: RATIO_MAP.get(x, f"{x}:1"))
-    s_open_time = st.time_input("営業開始", value=st.session_state.settings["open_time"])
-    s_close_time = st.time_input("営業終了", value=st.session_state.settings["close_time"])
-    s_fulltime = st.number_input("常勤時間(週)", value=st.session_state.settings["fulltime_hours"], step=0.5)
-    
-    st.subheader("定休日設定")
-    s_closed_days = st.multiselect("曜日定休", ["月", "火", "水", "木", "金", "土", "日"], default=st.session_state.settings["closed_days"])
-    s_close_holiday = st.checkbox("祝日は休みにする", value=st.session_state.settings["close_on_holiday"])
-    
-    st.caption("※加算の取得期間設定は「マスタ・休暇」タブで行います")
-
-    if st.form_submit_button("設定を保存"):
-        new_settings = st.session_state.settings.copy()
-        new_settings.update({
-            "facility_name": s_fac_name, "opening_date": s_open_date, "capacity": s_capacity,
-            "open_time": s_open_time, "close_time": s_close_time, "fulltime_hours": s_fulltime,
-            "closed_days": s_closed_days, "close_on_holiday": s_close_holiday, "service_ratio": s_ratio_val
-        })
-        st.session_state.settings = new_settings
-        save_settings_to_sheet(new_settings)
-        st.success("設定をクラウドに保存しました")
-        # リセットなし
+        if st.form_submit_button("設定を保存"):
+            new_settings = st.session_state.settings.copy()
+            new_settings.update({
+                "facility_name": s_fac_name, "opening_date": s_open_date, "capacity": s_capacity,
+                "open_time": s_open_time, "close_time": s_close_time, "fulltime_hours": s_fulltime,
+                "add_ons": s_addons, "closed_days": s_closed_days, "close_on_holiday": s_close_holiday,
+                "service_ratio": s_ratio_val
+            })
+            st.session_state.settings = new_settings
+            save_settings_to_sheet(new_settings)
+            st.success("設定をクラウドに保存しました")
+            reload_all_data()
 
 # 変数展開
 fulltime_weekly_hours = st.session_state.settings["fulltime_hours"]
@@ -415,13 +428,16 @@ service_ratio = st.session_state.settings.get("service_ratio", 6.0)
 closed_days_select = st.session_state.settings["closed_days"]
 close_on_holiday = st.session_state.settings["close_on_holiday"]
 
-# --- メインエリア ---
-tab1, tab2, tab3, tab4 = st.tabs(["🛠️ マスタ・休暇", "👥 従業員マスタ", "📅 実績・人員計算", "📝 シフト作成"])
+# ==========================================
+# メイン画面 (メニュー分岐)
+# ==========================================
 
 # ------------------------------------------
-# TAB 1: マスタ・休暇
+# 画面1: マスタ・休暇設定
 # ------------------------------------------
-with tab1:
+if menu == "マスタ・休暇設定":
+    st.header("🛠️ マスタ・休暇設定")
+    
     st.subheader("1. 勤務区分設定")
     c_p1, c_p2 = st.columns([2, 1])
     with c_p1:
@@ -504,10 +520,10 @@ with tab1:
             reload_all_data()
 
 # ------------------------------------------
-# TAB 2: 従業員マスタ
+# 画面2: 従業員マスタ
 # ------------------------------------------
-with tab2:
-    st.header("👥 従業員詳細設定")
+elif menu == "従業員マスタ":
+    st.header("👥 従業員マスタ")
     st.info("※「兼務時間」に入力した時間は、主たる職種の時間から差し引かれ、従たる職種の時間として計算されます。")
     
     active_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=None)
@@ -535,12 +551,13 @@ with tab2:
         st.session_state.staff_db = final_df 
         save_data_to_sheet("staff_master", final_df) 
         st.success("保存しました")
+        # リロードはするが、session_stateのmenuが維持されるので同じ画面に戻ってくる
         reload_all_data()
 
 # ------------------------------------------
-# TAB 3: 実績・人員計算
+# 画面3: 実績・人員計算
 # ------------------------------------------
-with tab3:
+elif menu == "実績・人員計算":
     st.header("📊 実績入力と必要人員計算")
     st.subheader("1. 月次実績の入力")
     col_in1, col_in2 = st.columns([1, 2])
@@ -667,9 +684,9 @@ with tab3:
             for d in details: st.write(f"- {d}")
 
 # ------------------------------------------
-# TAB 4: シフト作成
+# 画面4: シフト作成
 # ------------------------------------------
-with tab4:
+elif menu == "シフト作成":
     st.header("📝 シフト作成")
     
     col_sy, col_sm = st.columns(2)
