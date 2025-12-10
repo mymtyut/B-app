@@ -5,7 +5,7 @@ import math
 import datetime
 import calendar
 import json
-import time # sleep用にインポート
+import time
 from dateutil.relativedelta import relativedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -23,8 +23,7 @@ def get_gspread_client():
     client = gspread.authorize(creds)
     return client
 
-# 【重要修正】ここをキャッシュ化して、何度も接続しに行かないようにする
-@st.cache_resource(ttl=600) 
+@st.cache_resource(ttl=600)
 def get_spreadsheet():
     client = get_gspread_client()
     sheet_url = st.secrets["spreadsheet"]["url"]
@@ -41,7 +40,6 @@ def load_data_from_sheet(worksheet_name, default_df=None):
         return pd.DataFrame(data)
     except gspread.WorksheetNotFound:
         if default_df is not None:
-            # 作成時は少し待つ（エラー回避）
             time.sleep(1)
             worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
             save_data_to_sheet(worksheet_name, default_df)
@@ -250,18 +248,6 @@ def get_active_staff_df(original_df, settings, target_date_obj=None):
             if pd.notnull(resign_date) and resign_date < target_date_obj: is_resigned = True
             active_mask.append(is_hired and not is_resigned)
         df = df[active_mask]
-
-        exclude_targets = []
-        wage_active = is_addon_active(target_date_obj, settings.get("wage_history", []))
-        lunch_active = is_addon_active(target_date_obj, settings.get("lunch_history", []))
-        trans_active = is_addon_active(target_date_obj, settings.get("transport_history", []))
-        
-        if not wage_active: exclude_targets.append("目標工賃達成指導員")
-        if not lunch_active: exclude_targets.append("調理員")
-        if not trans_active: exclude_targets.append("運転手")
-        
-        if exclude_targets:
-            df = df[~df["職種(主)"].isin(exclude_targets)]
         
     return df
 
@@ -349,7 +335,6 @@ def load_data():
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
     data["staff"] = df_staff
 
-    # 利用者マスタ
     default_users = pd.DataFrame([
         {"利用者名": "山田太郎", "利用開始日": "2025-01-01", "利用終了日": "", "支給決定量タイプ": "原則日数(月-8)", "固定日数": 0}
     ])
@@ -405,7 +390,6 @@ if 'data_loaded' not in st.session_state:
         st.session_state.special_holidays_list = data["holidays"]
         st.session_state.monthly_records = data["records"]
         st.session_state.current_shift_df = data["draft_shift"]
-        # 一時保存用の利用者計算DF
         if "temp_users_calc" not in st.session_state:
             st.session_state.temp_users_calc = None
         st.session_state.data_loaded = True
@@ -413,17 +397,13 @@ if 'data_loaded' not in st.session_state:
 today = datetime.date.today()
 year_range = list(range(today.year - 2, today.year + 3))
 
-# --- サイドバー メニュー ---
 st.sidebar.title("メニュー")
 menu = st.sidebar.radio(
     "表示する画面を選択",
     ["マスタ・休暇設定", "従業員マスタ", "利用者マスタ", "実績・人員計算", "シフト作成"],
-    index=2
+    index=3
 )
-
 st.sidebar.divider()
-
-# --- サイドバー 設定フォーム ---
 st.sidebar.header("⚙️ 事業所全体設定")
 with st.sidebar.expander("詳細設定を開く"):
     with st.form("settings_form"):
@@ -444,8 +424,6 @@ with st.sidebar.expander("詳細設定を開く"):
         s_closed_days = st.multiselect("曜日定休", ["月", "火", "水", "木", "金", "土", "日"], default=st.session_state.settings["closed_days"])
         s_close_holiday = st.checkbox("祝日は休みにする", value=st.session_state.settings["close_on_holiday"])
         
-        st.caption("※定員変更・加算期間設定は「マスタ・休暇設定」画面で行います")
-
         if st.form_submit_button("設定を保存"):
             new_settings = st.session_state.settings.copy()
             new_settings.update({
@@ -458,7 +436,6 @@ with st.sidebar.expander("詳細設定を開く"):
             st.success("設定を保存しました")
             reload_all_data()
 
-# 変数展開
 fulltime_weekly_hours = st.session_state.settings["fulltime_hours"]
 service_ratio = st.session_state.settings.get("service_ratio", 6.0)
 closed_days_select = st.session_state.settings["closed_days"]
@@ -468,12 +445,8 @@ close_on_holiday = st.session_state.settings["close_on_holiday"]
 # メイン画面 (メニュー分岐)
 # ==========================================
 
-# ------------------------------------------
-# 画面1: マスタ・休暇設定
-# ------------------------------------------
 if menu == "マスタ・休暇設定":
     st.header("🛠️ マスタ・休暇設定")
-    
     st.subheader("1. 勤務区分設定")
     c_p1, c_p2 = st.columns([2, 1])
     with c_p1:
@@ -482,9 +455,7 @@ if menu == "マスタ・休暇設定":
         if st.button("勤務区分を保存"):
             st.session_state.shift_patterns = edited_patterns
             save_data_to_sheet("shift_patterns", edited_patterns)
-            st.success("保存しました")
-            reload_all_data()
-
+            st.success("保存しました"); reload_all_data()
     st.divider()
     st.subheader("2. 定員数の変更履歴")
     col_cap1, col_cap2 = st.columns([2, 1])
@@ -495,32 +466,23 @@ if menu == "マスタ・休暇設定":
         if "count" not in df_cap.columns: df_cap["count"] = 20
         df_cap["start"] = df_cap["start"].apply(safe_to_date)
         df_cap["count"] = pd.to_numeric(df_cap["count"], errors='coerce').fillna(20)
-        
-        cap_col_cfg = {
-            "start": st.column_config.DateColumn("開始日", required=True),
-            "count": st.column_config.NumberColumn("定員数", min_value=20, max_value=60, step=1, required=True),
-        }
+        cap_col_cfg = {"start": st.column_config.DateColumn("開始日", required=True), "count": st.column_config.NumberColumn("定員数", min_value=20, max_value=60, step=1, required=True)}
         new_cap_df = st.data_editor(df_cap, column_config=cap_col_cfg, num_rows="dynamic", use_container_width=True, key="editor_capacity")
-    
     with col_cap2:
         if st.button("定員履歴を保存"):
             def df_to_list_cap(df):
                 res = []
                 for _, row in df.iterrows():
-                    s = row["start"]
-                    c = row["count"]
+                    s = row["start"]; c = row["count"]
                     if not s: continue
                     if isinstance(s, pd.Timestamp): s = s.date()
                     res.append({"start": s, "count": int(c)})
                 return res
-            
             new_settings = st.session_state.settings.copy()
             new_settings["capacity_history"] = df_to_list_cap(new_cap_df)
             st.session_state.settings = new_settings
             save_settings_to_sheet(new_settings)
-            st.success("保存しました")
-            reload_all_data()
-
+            st.success("保存しました"); reload_all_data()
     st.divider()
     st.subheader("3. 加算取得期間の設定")
     col_a1, col_a2, col_a3 = st.columns(3)
@@ -531,17 +493,12 @@ if menu == "マスタ・休暇設定":
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         df_hist["start"] = df_hist["start"].apply(safe_to_date)
         df_hist["end"] = df_hist["end"].apply(safe_to_date)
-        column_cfg = {
-            "start": st.column_config.DateColumn("開始日", required=True),
-            "end": st.column_config.DateColumn("終了日"),
-        }
+        column_cfg = {"start": st.column_config.DateColumn("開始日", required=True), "end": st.column_config.DateColumn("終了日")}
         st.markdown(f"**{title}**")
         return st.data_editor(df_hist, column_config=column_cfg, num_rows="dynamic", use_container_width=True, key=f"editor_{key}")
-
     with col_a1: new_wage_df = render_history_editor("wage_history", "目標工賃達成指導員加算")
     with col_a2: new_trans_df = render_history_editor("transport_history", "送迎加算")
     with col_a3: new_lunch_df = render_history_editor("lunch_history", "食事提供加算")
-        
     if st.button("加算設定を保存"):
         def df_to_list(df):
             res = []
@@ -554,35 +511,24 @@ if menu == "マスタ・休暇設定":
                 if pd.isna(e): e = None
                 res.append({"start": s, "end": e})
             return res
-
         new_settings = st.session_state.settings.copy()
         new_settings["wage_history"] = df_to_list(new_wage_df)
         new_settings["transport_history"] = df_to_list(new_trans_df)
         new_settings["lunch_history"] = df_to_list(new_lunch_df)
-        
         st.session_state.settings = new_settings
         save_settings_to_sheet(new_settings)
-        st.success("保存しました")
-        reload_all_data()
-
+        st.success("保存しました"); reload_all_data()
     st.divider()
     st.subheader("4. 毎年繰り返す特別休暇")
     c_h1, c_h2 = st.columns([2, 1])
     with c_h1:
-        column_config_holiday = {
-            "名称": st.column_config.TextColumn("休暇名", required=True),
-            "開始月": st.column_config.NumberColumn("開始月", min_value=1, max_value=12),
-            "開始日": st.column_config.NumberColumn("開始日", min_value=1, max_value=31),
-            "終了月": st.column_config.NumberColumn("終了月", min_value=1, max_value=12),
-            "終了日": st.column_config.NumberColumn("終了日", min_value=1, max_value=31),
-        }
+        column_config_holiday = {"名称": st.column_config.TextColumn("休暇名", required=True), "開始月": st.column_config.NumberColumn("開始月", min_value=1, max_value=12), "開始日": st.column_config.NumberColumn("開始日", min_value=1, max_value=31), "終了月": st.column_config.NumberColumn("終了月", min_value=1, max_value=12), "終了日": st.column_config.NumberColumn("終了日", min_value=1, max_value=31)}
         edited_holidays = st.data_editor(st.session_state.special_holidays_list, column_config=column_config_holiday, num_rows="dynamic", use_container_width=True, key="holiday_editor_rec")
     with c_h2:
         if st.button("特別休暇を保存"):
             st.session_state.special_holidays_list = edited_holidays
             save_data_to_sheet("holidays", edited_holidays)
-            st.success("保存しました")
-            reload_all_data()
+            st.success("保存しました"); reload_all_data()
 
 elif menu == "従業員マスタ":
     st.header("👥 従業員マスタ")
@@ -607,8 +553,7 @@ elif menu == "従業員マスタ":
             if row["雇用形態"] == "常勤": final_df.at[idx, "契約時間(週)"] = fulltime_weekly_hours
         st.session_state.staff_db = final_df 
         save_data_to_sheet("staff_master", final_df) 
-        st.success("保存しました")
-        reload_all_data()
+        st.success("保存しました"); reload_all_data()
 
 elif menu == "利用者マスタ":
     st.header("🧑‍🤝‍🧑 利用者マスタ")
@@ -624,8 +569,7 @@ elif menu == "利用者マスタ":
     if st.button("利用者情報を保存", type="primary"):
         st.session_state.users_db = edited_users_df
         save_data_to_sheet("users_master", edited_users_df)
-        st.success("保存しました")
-        reload_all_data()
+        st.success("保存しました"); reload_all_data()
 
 elif menu == "実績・人員計算":
     st.header("📊 実績入力と必要人員計算")
@@ -637,7 +581,6 @@ elif menu == "実績・人員計算":
         target_ym = f"{s_year_rec}年{s_month_rec}月"
         st.caption(f"登録データ名: **{target_ym}**")
         
-        # --- 自動集計＆修正機能 ---
         st.markdown("---")
         st.write("🧑‍🤝‍🧑 **利用者ごとの実績入力**")
         
@@ -649,10 +592,8 @@ elif menu == "実績・人員計算":
             
             users_df = st.session_state.users_db
             temp_rows = []
-            
             for _, u in users_df.iterrows():
-                start = u["利用開始日"]
-                end = u["利用終了日"]
+                start = u["利用開始日"]; end = u["利用終了日"]
                 if not start: continue
                 if start > calc_end: continue
                 if end and end < calc_start: continue
@@ -660,12 +601,9 @@ elif menu == "実績・人員計算":
                 u_days = 0
                 if u["支給決定量タイプ"] == "原則日数(月-8)": u_days = principle_days
                 else: u_days = int(u["固定日数"]) if pd.notnull(u["固定日数"]) else 0
-                
                 temp_rows.append({"利用者名": u["利用者名"], "予定日数": u_days, "実績日数": u_days, "備考": ""})
-            
             st.session_state.temp_users_calc = pd.DataFrame(temp_rows)
         
-        # テーブル表示・編集
         calculated_total = 0
         if st.session_state.temp_users_calc is not None:
             user_calc_config = {
@@ -674,21 +612,12 @@ elif menu == "実績・人員計算":
                 "実績日数": st.column_config.NumberColumn(min_value=0, max_value=31, step=1, required=True),
                 "備考": st.column_config.TextColumn()
             }
-            edited_calc_df = st.data_editor(
-                st.session_state.temp_users_calc,
-                column_config=user_calc_config,
-                use_container_width=True,
-                num_rows="fixed",
-                hide_index=True,
-                key="calc_editor"
-            )
-            # 編集結果を合計
+            edited_calc_df = st.data_editor(st.session_state.temp_users_calc, column_config=user_calc_config, use_container_width=True, num_rows="fixed", hide_index=True, key="calc_editor")
             calculated_total = edited_calc_df["実績日数"].sum()
             st.metric("合計延べ利用者数 (集計結果)", f"{calculated_total} 人")
         else:
             st.info("上の「ロード」ボタンを押してリストを表示してください")
 
-        # 定員超過チェック等
         start_date = datetime.date(s_year_rec, s_month_rec, 1)
         last_day = calendar.monthrange(s_year_rec, s_month_rec)[1]
         temp_open_days = 0
@@ -701,7 +630,6 @@ elif menu == "実績・人員計算":
         
         current_cap = get_capacity_at_date(start_date, st.session_state.settings.get('capacity_history', []))
         
-        # 警告表示
         if temp_open_days > 0 and calculated_total > 0:
             daily_avg = calculated_total / temp_open_days
             if daily_avg > current_cap * 1.2:
@@ -709,8 +637,6 @@ elif menu == "実績・人員計算":
 
     with col_in2:
         st.metric("自動計算された開所日数", f"{temp_open_days} 日")
-        
-        # 保存ボタン (計算結果を使う)
         if st.button("集計結果を実績として保存", type="primary", disabled=(calculated_total==0)):
             df_recs = st.session_state.monthly_records
             df_recs = df_recs[df_recs["年月"] != target_ym]
@@ -718,18 +644,15 @@ elif menu == "実績・人員計算":
             st.session_state.monthly_records = pd.concat([df_recs, pd.DataFrame([new_row])], ignore_index=True)
             save_data_to_sheet("monthly_records", st.session_state.monthly_records)
             st.success(f"{target_ym} の実績（{calculated_total}人）を保存しました")
-            if "temp_users_input" in st.session_state:
-                del st.session_state["temp_users_input"]
+            if "temp_users_input" in st.session_state: del st.session_state["temp_users_input"]
             reload_all_data()
 
     st.divider()
-    # (以下、人員配置チェックロジックは前回と同じ)
+
     st.subheader("2. 平均利用人数と人員配置チェック")
     col_cy, col_cm = st.columns(2)
-    with col_cy:
-        c_year_calc = st.selectbox("計算対象年", year_range, index=year_range.index(today.year), key="calc_y")
-    with col_cm:
-        c_month_calc = st.selectbox("計算対象月", list(range(1, 13)), index=today.month - 1, key="calc_m")
+    with col_cy: c_year_calc = st.selectbox("計算対象年", year_range, index=year_range.index(today.year), key="calc_y")
+    with col_cm: c_month_calc = st.selectbox("計算対象月", list(range(1, 13)), index=today.month - 1, key="calc_m")
     calc_target_date = datetime.date(c_year_calc, c_month_calc, 1)
     
     warning_messages = []
@@ -763,30 +686,74 @@ elif menu == "実績・人員計算":
             with st.expander("計算根拠"): st.dataframe(calc_result["details_df"], use_container_width=True)
 
     with c_res2:
-        base_staff = avg_users / service_ratio
-        add_staff = 1.0 if wage_active else 0.0
-        required_staff = ceil_decimal_1(base_staff + add_staff)
-        st.metric(f"必要人員合計", f"{required_staff} 人")
+        # --- 【修正】必要人員の内訳表示 ---
+        base_staff_raw = avg_users / service_ratio
+        base_staff_req = ceil_decimal_1(base_staff_raw) # 基礎分（切り上げ）
+        wage_staff_req = 1.0 if wage_active else 0.0 # 加算分
+        total_req = base_staff_req + wage_staff_req
         
+        display_ratio = RATIO_MAP.get(service_ratio, f"{service_ratio}:1")
+        st.metric(f"必要人員合計 ({display_ratio})", f"{total_req} 人")
+        st.caption(f"内訳: 職業指導員・生活支援員 {base_staff_req}人 + 目標工賃達成指導員 {wage_staff_req}人")
+        
+        st.markdown("**現在のマスタと照合（兼務考慮）**")
         current_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=calc_target_date)
-        actual_fte = 0.0
-        target_roles = ["職業指導員", "生活支援員", "目標工賃達成指導員"]
+        
+        # --- 【修正】配置人員の内訳計算 ---
+        actual_base_fte = 0.0 # 基礎分（職業指導員・生活支援員）
+        actual_wage_fte = 0.0 # 加算分（目標工賃達成指導員）
+        
+        base_roles = ["職業指導員", "生活支援員"]
+        wage_roles = ["目標工賃達成指導員"]
+        
+        details_log = []
+        
         for _, staff in current_staff_df.iterrows():
             total_h = staff["契約時間(週)"]; sub_h = staff["兼務時間(週)"]
             try: total_h=float(total_h); sub_h=float(sub_h)
             except: total_h=0; sub_h=0
-            main_h = max(0, total_h - sub_h)
-            target_h = 0.0
-            if staff["職種(主)"] in target_roles: target_h += main_h
-            if staff["職種(副)"] in target_roles: target_h += sub_h
-            if target_h > 0:
-                fte = target_h / fulltime_weekly_hours
-                if fte > 1.0: fte = 1.0
-                actual_fte += fte
-        actual_fte = round(actual_fte, 1)
-        st.metric("配置可能人員", f"{actual_fte} 人")
-        if actual_fte >= required_staff: st.success("✅ 充足")
-        else: st.error(f"❌ 不足 {round(required_staff - actual_fte, 1)}人")
+            
+            main_h = max(0, total_h - sub_h) # 主務時間
+            
+            # 主務の判定
+            if staff["職種(主)"] in base_roles:
+                fte = main_h / fulltime_weekly_hours
+                actual_base_fte += fte
+                if fte > 0: details_log.append(f"{staff['名前']}(主): 支援員等 {fte:.2f}人分")
+            elif staff["職種(主)"] in wage_roles:
+                fte = main_h / fulltime_weekly_hours
+                actual_wage_fte += fte
+                if fte > 0: details_log.append(f"{staff['名前']}(主): 目標工賃 {fte:.2f}人分")
+                
+            # 兼務（副）の判定
+            if staff["職種(副)"] in base_roles:
+                fte = sub_h / fulltime_weekly_hours
+                actual_base_fte += fte
+                if fte > 0: details_log.append(f"{staff['名前']}(副): 支援員等 {fte:.2f}人分")
+            elif staff["職種(副)"] in wage_roles:
+                fte = sub_h / fulltime_weekly_hours
+                actual_wage_fte += fte
+                if fte > 0: details_log.append(f"{staff['名前']}(副): 目標工賃 {fte:.2f}人分")
+
+        actual_base_fte = round(actual_base_fte, 2)
+        actual_wage_fte = round(actual_wage_fte, 2)
+        total_actual = actual_base_fte + actual_wage_fte
+        
+        st.metric("配置可能人員", f"{total_actual:.1f} 人")
+        
+        # 判定
+        is_base_ok = actual_base_fte >= base_staff_req
+        is_wage_ok = actual_wage_fte >= wage_staff_req
+        
+        if is_base_ok and is_wage_ok:
+            st.success("✅ 充足")
+        else:
+            st.error("❌ 不足あり")
+            if not is_base_ok: st.write(f"- 支援員等が {round(base_staff_req - actual_base_fte, 2)}人 不足")
+            if not is_wage_ok: st.write(f"- 目標工賃担当が {round(wage_staff_req - actual_wage_fte, 2)}人 不足")
+            
+        with st.expander("詳細内訳"):
+            for d in details_log: st.write(f"- {d}")
 
 elif menu == "シフト作成":
     st.header("📝 シフト作成")
@@ -802,14 +769,13 @@ elif menu == "シフト作成":
     start_dt = shift_month.replace(day=1)
     end_dt = start_dt + relativedelta(months=1) - datetime.timedelta(days=1)
     dates = pd.date_range(start_dt, end_dt)
-    jp_days = ["月","火","水","木","金","土","日"]
     date_cols = []; holiday_cols = []
     
     for d in dates:
-        d_label = f"{d.day}({jp_days[d.weekday()]})"
+        d_label = f"{d.day}({JP_DAYS[d.weekday()]})"
         date_cols.append(d_label)
         is_holiday = False
-        wd_str = jp_days[d.weekday()]
+        wd_str = JP_DAYS[d.weekday()]
         if wd_str in closed_days_select: is_holiday = True
         elif close_on_holiday and jpholiday.is_holiday(d.date()): is_holiday = True
         else:
@@ -823,10 +789,10 @@ elif menu == "シフト作成":
             s_name = staff["名前"]
             row_data = {"氏名": s_name}
             for d in dates:
-                d_label = f"{d.day}({jp_days[d.weekday()]})"
+                d_label = f"{d.day}({JP_DAYS[d.weekday()]})"
                 is_closed = (d_label in holiday_cols)
                 if is_closed: row_data[d_label] = "休"
-                elif jp_days[d.weekday()] in staff["固定休"]: row_data[d_label] = "公休"
+                elif JP_DAYS[d.weekday()] in staff["固定休"]: row_data[d_label] = "公休"
                 else: row_data[d_label] = staff["基本シフト"]
             rows.append(row_data)
         new_df = pd.DataFrame(rows)
