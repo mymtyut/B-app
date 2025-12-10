@@ -5,6 +5,7 @@ import math
 import datetime
 import calendar
 import json
+import time # sleep用にインポート
 from dateutil.relativedelta import relativedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -22,6 +23,8 @@ def get_gspread_client():
     client = gspread.authorize(creds)
     return client
 
+# 【重要修正】ここをキャッシュ化して、何度も接続しに行かないようにする
+@st.cache_resource(ttl=600) 
 def get_spreadsheet():
     client = get_gspread_client()
     sheet_url = st.secrets["spreadsheet"]["url"]
@@ -38,6 +41,8 @@ def load_data_from_sheet(worksheet_name, default_df=None):
         return pd.DataFrame(data)
     except gspread.WorksheetNotFound:
         if default_df is not None:
+            # 作成時は少し待つ（エラー回避）
+            time.sleep(1)
             worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
             save_data_to_sheet(worksheet_name, default_df)
             return default_df
@@ -48,6 +53,7 @@ def save_data_to_sheet(worksheet_name, df):
     try:
         worksheet = sh.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
+        time.sleep(1)
         worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
     
     headers = df.columns.values.tolist()
@@ -462,6 +468,9 @@ close_on_holiday = st.session_state.settings["close_on_holiday"]
 # メイン画面 (メニュー分岐)
 # ==========================================
 
+# ------------------------------------------
+# 画面1: マスタ・休暇設定
+# ------------------------------------------
 if menu == "マスタ・休暇設定":
     st.header("🛠️ マスタ・休暇設定")
     
@@ -486,8 +495,13 @@ if menu == "マスタ・休暇設定":
         if "count" not in df_cap.columns: df_cap["count"] = 20
         df_cap["start"] = df_cap["start"].apply(safe_to_date)
         df_cap["count"] = pd.to_numeric(df_cap["count"], errors='coerce').fillna(20)
-        cap_col_cfg = {"start": st.column_config.DateColumn("開始日", required=True), "count": st.column_config.NumberColumn("定員数", min_value=20, max_value=60, step=1, required=True)}
+        
+        cap_col_cfg = {
+            "start": st.column_config.DateColumn("開始日", required=True),
+            "count": st.column_config.NumberColumn("定員数", min_value=20, max_value=60, step=1, required=True),
+        }
         new_cap_df = st.data_editor(df_cap, column_config=cap_col_cfg, num_rows="dynamic", use_container_width=True, key="editor_capacity")
+    
     with col_cap2:
         if st.button("定員履歴を保存"):
             def df_to_list_cap(df):
@@ -499,6 +513,7 @@ if menu == "マスタ・休暇設定":
                     if isinstance(s, pd.Timestamp): s = s.date()
                     res.append({"start": s, "count": int(c)})
                 return res
+            
             new_settings = st.session_state.settings.copy()
             new_settings["capacity_history"] = df_to_list_cap(new_cap_df)
             st.session_state.settings = new_settings
@@ -516,13 +531,17 @@ if menu == "マスタ・休暇設定":
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         df_hist["start"] = df_hist["start"].apply(safe_to_date)
         df_hist["end"] = df_hist["end"].apply(safe_to_date)
-        column_cfg = {"start": st.column_config.DateColumn("開始日", required=True), "end": st.column_config.DateColumn("終了日")}
+        column_cfg = {
+            "start": st.column_config.DateColumn("開始日", required=True),
+            "end": st.column_config.DateColumn("終了日"),
+        }
         st.markdown(f"**{title}**")
         return st.data_editor(df_hist, column_config=column_cfg, num_rows="dynamic", use_container_width=True, key=f"editor_{key}")
 
     with col_a1: new_wage_df = render_history_editor("wage_history", "目標工賃達成指導員加算")
     with col_a2: new_trans_df = render_history_editor("transport_history", "送迎加算")
     with col_a3: new_lunch_df = render_history_editor("lunch_history", "食事提供加算")
+        
     if st.button("加算設定を保存"):
         def df_to_list(df):
             res = []
@@ -535,10 +554,12 @@ if menu == "マスタ・休暇設定":
                 if pd.isna(e): e = None
                 res.append({"start": s, "end": e})
             return res
+
         new_settings = st.session_state.settings.copy()
         new_settings["wage_history"] = df_to_list(new_wage_df)
         new_settings["transport_history"] = df_to_list(new_trans_df)
         new_settings["lunch_history"] = df_to_list(new_lunch_df)
+        
         st.session_state.settings = new_settings
         save_settings_to_sheet(new_settings)
         st.success("保存しました")
@@ -548,7 +569,13 @@ if menu == "マスタ・休暇設定":
     st.subheader("4. 毎年繰り返す特別休暇")
     c_h1, c_h2 = st.columns([2, 1])
     with c_h1:
-        column_config_holiday = {"名称": st.column_config.TextColumn("休暇名", required=True), "開始月": st.column_config.NumberColumn("開始月", min_value=1, max_value=12), "開始日": st.column_config.NumberColumn("開始日", min_value=1, max_value=31), "終了月": st.column_config.NumberColumn("終了月", min_value=1, max_value=12), "終了日": st.column_config.NumberColumn("終了日", min_value=1, max_value=31)}
+        column_config_holiday = {
+            "名称": st.column_config.TextColumn("休暇名", required=True),
+            "開始月": st.column_config.NumberColumn("開始月", min_value=1, max_value=12),
+            "開始日": st.column_config.NumberColumn("開始日", min_value=1, max_value=31),
+            "終了月": st.column_config.NumberColumn("終了月", min_value=1, max_value=12),
+            "終了日": st.column_config.NumberColumn("終了日", min_value=1, max_value=31),
+        }
         edited_holidays = st.data_editor(st.session_state.special_holidays_list, column_config=column_config_holiday, num_rows="dynamic", use_container_width=True, key="holiday_editor_rec")
     with c_h2:
         if st.button("特別休暇を保存"):
@@ -691,6 +718,8 @@ elif menu == "実績・人員計算":
             st.session_state.monthly_records = pd.concat([df_recs, pd.DataFrame([new_row])], ignore_index=True)
             save_data_to_sheet("monthly_records", st.session_state.monthly_records)
             st.success(f"{target_ym} の実績（{calculated_total}人）を保存しました")
+            if "temp_users_input" in st.session_state:
+                del st.session_state["temp_users_input"]
             reload_all_data()
 
     st.divider()
