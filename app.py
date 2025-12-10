@@ -33,7 +33,6 @@ def load_data_from_sheet(worksheet_name, default_df=None):
     try:
         worksheet = sh.worksheet(worksheet_name)
         data = worksheet.get_all_records()
-        # データが空、または列不足の場合の対応
         if not data:
             return default_df if default_df is not None else pd.DataFrame()
         return pd.DataFrame(data)
@@ -44,6 +43,7 @@ def load_data_from_sheet(worksheet_name, default_df=None):
             return default_df
         return pd.DataFrame()
 
+# 【重要修正】保存時のクリーニング処理を強化
 def save_data_to_sheet(worksheet_name, df):
     sh = get_spreadsheet()
     try:
@@ -51,24 +51,33 @@ def save_data_to_sheet(worksheet_name, df):
     except gspread.WorksheetNotFound:
         worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
     
-    # データ準備
     headers = df.columns.values.tolist()
     data_list = df.values.tolist()
     all_values = [headers] + data_list
     
-    # シートのリサイズ（エラー回避）
     try:
         worksheet.resize(rows=max(len(all_values)+10, 100), cols=max(len(headers), 5))
     except:
         pass
     
-    # 全データを文字列化してJSONエラーを防ぐ
     clean_params = []
     for row in all_values:
         clean_row = []
         for cell in row:
-            if pd.isna(cell):
+            # リスト型になってしまっている場合、中身を取り出す
+            if isinstance(cell, list):
+                if len(cell) > 0:
+                    cell = cell[0]
+                else:
+                    cell = ""
+            
+            # 日付型
+            if isinstance(cell, (datetime.date, datetime.datetime, datetime.time)):
+                clean_row.append(str(cell))
+            # 空値
+            elif pd.isna(cell):
                 clean_row.append("")
+            # それ以外
             else:
                 clean_row.append(str(cell))
         clean_params.append(clean_row)
@@ -84,7 +93,6 @@ def load_settings_from_sheet():
         val = ws.acell('A1').value
         if val:
             settings = json.loads(val)
-            # 日付型の復元
             keys_to_date = ["opening_date", "wage_start", "transport_start", "lunch_start"]
             keys_to_time = ["open_time", "close_time"]
             
@@ -96,7 +104,6 @@ def load_settings_from_sheet():
                 if k in settings and settings[k]:
                     settings[k] = datetime.datetime.strptime(settings[k], "%H:%M:%S").time()
             
-            # 履歴リストの日付復元
             for hist_key in ["wage_history", "transport_history", "lunch_history"]:
                 if hist_key in settings:
                     for item in settings[hist_key]:
@@ -107,7 +114,6 @@ def load_settings_from_sheet():
                         else:
                             item["end"] = None
 
-            # デフォルト値補完
             defaults = _get_default_settings_obj()
             for k, v in defaults.items():
                 if k not in settings: settings[k] = v
@@ -118,14 +124,11 @@ def load_settings_from_sheet():
 
 def save_settings_to_sheet(settings_dict):
     s_save = settings_dict.copy()
-    
-    # 基本日付のシリアライズ
     for k, v in s_save.items():
         if isinstance(v, (datetime.date, datetime.time)):
             fmt = "%H:%M:%S" if isinstance(v, datetime.time) else "%Y-%m-%d"
             s_save[k] = v.strftime(fmt)
     
-    # 履歴リストのシリアライズ
     for hist_key in ["wage_history", "transport_history", "lunch_history"]:
         if hist_key in s_save:
             new_list = []
@@ -141,13 +144,11 @@ def save_settings_to_sheet(settings_dict):
             s_save[hist_key] = new_list
 
     json_str = json.dumps(s_save, ensure_ascii=False)
-    
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet("settings")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="settings", rows=10, cols=10)
-    
     ws.update_acell('A1', json_str)
 
 # ==========================================
@@ -196,15 +197,25 @@ def is_addon_active(target_date, history_list):
             if start <= t <= end: return True
     return False
 
-# 強力な日付変換ヘルパー
+# 【重要修正】汚れたデータ（['2024-..']）をきれいにする強力な変換関数
 def safe_to_date(val):
-    if pd.isnull(val) or val == "" or str(val).strip() == "": return None
+    if pd.isnull(val): return None
+    
+    # 文字列変換してゴミを取る
+    s_val = str(val).strip()
+    
+    # ['...'] や "..." を取り除く
+    s_val = s_val.replace("['", "").replace("']", "").replace('["', "").replace('"]', "").replace("'", "").replace('"', "")
+    
+    if s_val == "": return None
+    
     try:
-        # 既に日付型の場合
+        # すでに日付型の場合
         if isinstance(val, (datetime.date, datetime.datetime)):
             return val.date() if isinstance(val, datetime.datetime) else val
-        # 文字列からの変換 (YYYY/MM/DD, YYYY-MM-DD など対応)
-        return pd.to_datetime(val).date()
+        
+        # 文字列からの変換
+        return pd.to_datetime(s_val).date()
     except:
         return None
 
@@ -218,23 +229,21 @@ def load_data():
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
     
-    # 列が存在しない場合の強制追加（これが退職日が表示されない対策）
+    # 列不足対策
     required_cols = ["名前", "職種(主)", "職種(副)", "雇用形態", "契約時間(週)", "兼務時間(週)", "基本シフト", "固定休", "入社日", "退職日"]
     for col in required_cols:
         if col not in df_staff.columns:
-            df_staff[col] = None # 列を作る
+            df_staff[col] = None
 
-    # 型変換
+    # 型変換適用（ここでゴミデータがきれいになる）
     df_staff["入社日"] = df_staff["入社日"].apply(safe_to_date)
     df_staff["退職日"] = df_staff["退職日"].apply(safe_to_date)
     
-    # 数値変換
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
     
     data["staff"] = df_staff
 
-    # 他のマスタ読み込み
     default_patterns = pd.DataFrame([
         {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
     ])
@@ -263,7 +272,12 @@ def load_data():
 
 st.set_page_config(page_title="就労B型 管理システム (Cloud版)", layout="wide")
 
-# 初回ロード
+# データを強制リロードする関数
+def reload_all_data():
+    if 'data_loaded' in st.session_state:
+        del st.session_state['data_loaded']
+    st.rerun()
+
 if 'data_loaded' not in st.session_state:
     with st.spinner("スプレッドシートからデータを読み込んでいます..."):
         data = load_data()
@@ -276,19 +290,6 @@ if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = True
 
 # --- ヘルパー関数 ---
-def is_special_holiday_recurring(target_date, holiday_df):
-    t_md = (target_date.month, target_date.day)
-    for _, row in holiday_df.iterrows():
-        try:
-            s_md = (int(row["開始月"]), int(row["開始日"]))
-            e_md = (int(row["終了月"]), int(row["終了日"]))
-            if s_md <= e_md:
-                if s_md <= t_md <= e_md: return True, row["名称"]
-            else:
-                if t_md >= s_md or t_md <= e_md: return True, row["名称"]
-        except ValueError: continue
-    return False, ""
-
 def get_active_staff_df(original_df, settings, target_date_obj=None):
     df = original_df.copy()
     
@@ -452,7 +453,7 @@ with tab1:
             st.session_state.shift_patterns = edited_patterns
             save_data_to_sheet("shift_patterns", edited_patterns)
             st.success("保存しました")
-            # リセットなし
+            reload_all_data()
 
     st.divider()
     
@@ -464,6 +465,8 @@ with tab1:
     def render_history_editor(key, title):
         current_list = st.session_state.settings.get(key, [])
         df_hist = pd.DataFrame(current_list)
+        
+        # 安全な日付変換
         if "start" not in df_hist.columns: df_hist["start"] = pd.Series(dtype='datetime64[ns]')
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         
@@ -487,10 +490,13 @@ with tab1:
             for _, row in df.iterrows():
                 s, e = row["start"], row["end"]
                 if not s: continue 
+                
                 if isinstance(s, pd.Timestamp): s = s.date()
                 if isinstance(e, pd.Timestamp): e = e.date()
+                
                 if pd.isna(s): continue
                 if pd.isna(e): e = None
+                
                 res.append({"start": s, "end": e})
             return res
 
@@ -502,7 +508,7 @@ with tab1:
         st.session_state.settings = new_settings
         save_settings_to_sheet(new_settings)
         st.success("保存しました")
-        # リセットなし
+        reload_all_data()
 
     st.divider()
 
@@ -522,13 +528,15 @@ with tab1:
             st.session_state.special_holidays_list = edited_holidays
             save_data_to_sheet("holidays", edited_holidays)
             st.success("保存しました")
-            # リセットなし
+            reload_all_data()
 
 # ------------------------------------------
 # TAB 2: 従業員マスタ
 # ------------------------------------------
 with tab2:
     st.header("👥 従業員詳細設定")
+    st.info("※「兼務時間」に入力した時間は、主たる職種の時間から差し引かれ、従たる職種の時間として計算されます。")
+    
     active_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=None)
     shift_codes = st.session_state.shift_patterns["コード"].tolist() if not st.session_state.shift_patterns.empty else []
     job_options = ["管理者", "サービス管理責任者", "職業指導員", "生活支援員", "目標工賃達成指導員", "調理員", "運転手", "事務員", "看護職員", "なし"]
@@ -552,10 +560,11 @@ with tab2:
             if row["雇用形態"] == "常勤": final_df.at[idx, "契約時間(週)"] = fulltime_weekly_hours
         
         # 1. 保存
-        st.session_state.staff_db = final_df # セッションステート更新
-        save_data_to_sheet("staff_master", final_df) # シート保存
+        st.session_state.staff_db = final_df 
+        save_data_to_sheet("staff_master", final_df) 
         st.success("保存しました")
-        # リセットなし
+        # 2. 強制リロード
+        reload_all_data()
 
 # ------------------------------------------
 # TAB 3: 実績・人員計算
@@ -594,8 +603,8 @@ with tab3:
             new_row = {"年月": target_ym, "延べ利用者数": users_input, "開所日数": calc_open_days}
             st.session_state.monthly_records = pd.concat([df_recs, pd.DataFrame([new_row])], ignore_index=True)
             save_data_to_sheet("monthly_records", st.session_state.monthly_records)
-            st.success(f"{target_ym} の実績を保存しました")
-            # リセットなし
+            st.success("保存しました")
+            reload_all_data()
 
     st.divider()
 
