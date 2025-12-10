@@ -172,25 +172,29 @@ def ceil_decimal_1(value):
     return math.ceil(value * 10) / 10
 
 def is_addon_active(target_date, history_list):
-    """
-    指定された日が、履歴リストの期間内に含まれているか判定
-    """
     if not history_list:
         return False
-        
     t = target_date
     for period in history_list:
         start = period.get("start")
         end = period.get("end")
-        
         if start is None: continue 
-        
-        # 期間判定
-        if end is None: # 終了日なし＝継続中
+        if end is None: 
             if t >= start: return True
-        else: # 終了日あり
+        else: 
             if start <= t <= end: return True
     return False
+
+# 安全な日付変換ヘルパー
+def safe_to_date(val):
+    if pd.isnull(val) or val == "":
+        return None
+    try:
+        if isinstance(val, (datetime.date, datetime.datetime)):
+            return val.date() if isinstance(val, datetime.datetime) else val
+        return pd.to_datetime(val).date()
+    except:
+        return None
 
 def load_data():
     data = {}
@@ -203,11 +207,16 @@ def load_data():
         {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "兼務時間(週)": 0.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
-    df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
-    df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
+    
+    # 【重要】日付列を安全に変換 (NaNをNoneにする)
+    df_staff["入社日"] = df_staff["入社日"].apply(safe_to_date)
+    df_staff["退職日"] = df_staff["退職日"].apply(safe_to_date)
+    
+    # 数値列の変換
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
     if "兼務時間(週)" not in df_staff.columns: df_staff["兼務時間(週)"] = 0.0
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
+    
     data["staff"] = df_staff
 
     default_patterns = pd.DataFrame([
@@ -269,21 +278,23 @@ def is_special_holiday_recurring(target_date, holiday_df):
 
 def get_active_staff_df(original_df, settings, target_date_obj=None):
     df = original_df.copy()
+    
+    # 【重要】ここでも再度安全な日付変換を行う（フィルタリング処理のため）
+    df["入社日"] = df["入社日"].apply(safe_to_date)
+    df["退職日"] = df["退職日"].apply(safe_to_date)
+
     if target_date_obj:
         last_day = calendar.monthrange(target_date_obj.year, target_date_obj.month)[1]
         month_end = datetime.date(target_date_obj.year, target_date_obj.month, last_day)
-        
-        df["入社日"] = pd.to_datetime(df["入社日"]).dt.date
-        df["退職日"] = pd.to_datetime(df["退職日"]).dt.date
         
         active_mask = []
         for _, row in df.iterrows():
             hire_date = row["入社日"]
             resign_date = row["退職日"]
             is_hired = True
-            if pd.notnull(hire_date) and hire_date > month_end: is_hired = False
+            if hire_date and hire_date > month_end: is_hired = False
             is_resigned = False
-            if pd.notnull(resign_date) and resign_date < target_date_obj: is_resigned = True
+            if resign_date and resign_date < target_date_obj: is_resigned = True
             active_mask.append(is_hired and not is_resigned)
         df = df[active_mask]
 
@@ -442,12 +453,12 @@ with tab1:
         current_list = st.session_state.settings.get(key, [])
         df_hist = pd.DataFrame(current_list)
         
-        # 【修正】日付型への強制変換と列定義
+        # 安全な日付変換
         if "start" not in df_hist.columns: df_hist["start"] = pd.Series(dtype='datetime64[ns]')
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         
-        df_hist["start"] = pd.to_datetime(df_hist["start"], errors='coerce')
-        df_hist["end"] = pd.to_datetime(df_hist["end"], errors='coerce')
+        df_hist["start"] = df_hist["start"].apply(safe_to_date)
+        df_hist["end"] = df_hist["end"].apply(safe_to_date)
         
         column_cfg = {
             "start": st.column_config.DateColumn("開始日", required=True),
@@ -465,10 +476,17 @@ with tab1:
             res = []
             for _, row in df.iterrows():
                 s, e = row["start"], row["end"]
-                if pd.isna(s): continue
+                # data_editorからは日付型やTimestamp型が返る可能性がある
+                if not s: continue 
+                
+                # Timestamp -> date
                 if isinstance(s, pd.Timestamp): s = s.date()
                 if isinstance(e, pd.Timestamp): e = e.date()
+                
+                # NaT/None -> None (保存時は空文字に変換される)
+                if pd.isna(s): continue
                 if pd.isna(e): e = None
+                
                 res.append({"start": s, "end": e})
             return res
 
@@ -635,19 +653,14 @@ with tab3:
 
     with c_res2:
         base_staff = avg_users / service_ratio
-        
-        # 加算分 (目標工賃のみ人員数に影響させると仮定)
         add_staff = 0.0
-        if wage_active:
-            add_staff = 1.0
-            
+        if wage_active: add_staff = 1.0
         required_staff = ceil_decimal_1(base_staff + add_staff)
         display_ratio = RATIO_MAP.get(service_ratio, f"{service_ratio}:1")
         st.metric(f"必要人員合計 ({display_ratio})", f"{required_staff} 人", help=f"基準配置 {base_staff:.2f} + 加算配置 {add_staff} (端数切り上げ)")
         
         st.markdown("**現在のマスタと照合（兼務考慮）**")
         current_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=calc_target_date)
-        
         actual_fte = 0.0
         target_roles = ["職業指導員", "生活支援員", "目標工賃達成指導員"]
         details = []
@@ -669,12 +682,8 @@ with tab3:
 
         actual_fte = round(actual_fte, 1)
         st.metric("配置可能人員", f"{actual_fte} 人")
-        
-        if actual_fte >= required_staff:
-            st.success("✅ 充足")
-        else:
-            st.error(f"❌ 不足 {round(required_staff - actual_fte, 1)}人")
-            
+        if actual_fte >= required_staff: st.success("✅ 充足")
+        else: st.error(f"❌ 不足 {round(required_staff - actual_fte, 1)}人")
         with st.expander("内訳（兼務考慮済）"):
             for d in details: st.write(f"- {d}")
 
