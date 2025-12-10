@@ -263,71 +263,90 @@ def get_active_staff_df(original_df, settings, target_date_obj=None):
         
     return df
 
+# 【重要修正】平均利用人数の計算ロジック（4段階）
 def calculate_average_users_detail(target_date, opening_date, capacity_history, records_df):
-    diff = relativedelta(target_date, opening_date)
-    elapsed_months = diff.years * 12 + diff.months 
     explanation = { "rule_name": "", "period_start": "", "period_end": "", "details_df": None, "formula": "", "result": 0.0 }
     
+    # 0. 基本情報の整理
+    target_ym = target_date.replace(day=1)
+    open_ym = opening_date.replace(day=1)
+    
+    # 経過月数（0ヶ月目=開所月）
+    diff = relativedelta(target_ym, open_ym)
+    months_passed = diff.years * 12 + diff.months
+    
+    # 定員の取得
     current_capacity = get_capacity_at_date(target_date, capacity_history)
-
-    if elapsed_months < 6:
+    
+    # --- ケース1: 開所6ヶ月間 (months_passed: 0~5) ---
+    if months_passed < 6:
         explanation["rule_name"] = f"【新規開所特例】開所6ヶ月間 (定員{current_capacity}名)"
+        explanation["formula"] = f"定員 {current_capacity}人 × 90% ＝ 平均利用人数 {ceil_decimal_1(current_capacity * 0.9)}人"
         explanation["result"] = ceil_decimal_1(current_capacity * 0.9)
-        # 【修正】計算式を日本語で明確化
-        explanation["formula"] = f"定員 {current_capacity}人 × 90% ＝ 平均利用人数 {explanation['result']}人"
         return explanation
 
+    # 実績データの準備
+    if records_df.empty:
+        explanation["rule_name"] = "実績不足"
+        explanation["formula"] = "計算に必要な実績データがありません"
+        return explanation
+    
+    df_recs = records_df.copy()
+    df_recs["date"] = pd.to_datetime(df_recs["年月"].astype(str).str.replace("年", "-").str.replace("月", "-01")).dt.date
+    
+    # 前年度の期間を定義 (4月始まり)
+    # target_dateが属する年度の「前年度」
     current_fiscal_year = target_date.year if target_date.month >= 4 else target_date.year - 1
     last_fiscal_year = current_fiscal_year - 1
-    prev_start = datetime.date(last_fiscal_year, 4, 1)
-    prev_end = datetime.date(last_fiscal_year + 1, 3, 31)
+    prev_fy_start = datetime.date(last_fiscal_year, 4, 1)
+    prev_fy_end = datetime.date(last_fiscal_year + 1, 3, 31)
     
-    if records_df.empty:
-        explanation["rule_name"] = "実績データなし"
-        explanation["formula"] = "実績を入力してください"
-        return explanation
-
-    df_recs = records_df.copy()
-    df_recs["date"] = pd.to_datetime(df_recs["年月"].astype(str).str.replace("年", "-").str.replace("月", "-01"))
-    df_recs["dt_date"] = df_recs["date"].dt.date
+    # 前年度実績がフルにあるか判定（開所日が前年度の4/1以前か）
+    has_full_prev_fy = opening_date <= prev_fy_start
     
-    mask_prev = (df_recs["dt_date"] >= prev_start) & (df_recs["dt_date"] <= prev_end)
-    df_prev = df_recs[mask_prev]
-    is_experienced = opening_date <= prev_start
-    
-    target_df = pd.DataFrame()
-    rule_text = ""
-    
-    if is_experienced and not df_prev.empty:
-        target_df = df_prev
-        rule_text = f"【前年度実績】({prev_start.strftime('%Y年%m月')} ～ {prev_end.strftime('%Y年%m月')})"
+    # --- ケース4: 前年度実績がある場合 (年度更新後) ---
+    if has_full_prev_fy:
+        target_start = prev_fy_start
+        target_end = prev_fy_end
+        rule_name = f"【前年度実績】({prev_fy_start.strftime('%Y年%m月')} ～ {prev_fy_end.strftime('%Y年%m月')})"
+        
+    # --- ケース2: 7ヶ月目～12ヶ月目 (months_passed: 6~11) ---
+    elif months_passed < 12:
+        # 直近6ヶ月
+        target_end = target_ym - datetime.timedelta(days=1) # 前月末
+        target_start = target_end.replace(day=1) - relativedelta(months=5) # 6ヶ月前
+        rule_name = f"【直近6ヶ月実績】({target_start.strftime('%Y年%m月')} ～ {target_end.strftime('%Y年%m月')})"
+        
+    # --- ケース3: 13ヶ月目以降だが前年度実績なし (months_passed: 12~) ---
     else:
-        end_search = target_date.replace(day=1) - datetime.timedelta(days=1)
-        start_search_12 = end_search - relativedelta(months=11)
-        actual_start = start_search_12
-        if opening_date > actual_start: actual_start = opening_date.replace(day=1)
-        mask_recent = (df_recs["dt_date"] >= actual_start) & (df_recs["dt_date"] <= end_search)
-        df_recent = df_recs[mask_recent].sort_values("dt_date")
-        target_df = df_recent
-        rule_text = f"【直近実績】({actual_start.strftime('%Y年%m月')} ～ {end_search.strftime('%Y年%m月')})"
+        # 直近12ヶ月
+        target_end = target_ym - datetime.timedelta(days=1) # 前月末
+        target_start = target_end.replace(day=1) - relativedelta(months=11) # 12ヶ月前
+        rule_name = f"【直近12ヶ月実績】({target_start.strftime('%Y年%m月')} ～ {target_end.strftime('%Y年%m月')})"
 
+    # 対象期間のデータを抽出
+    mask = (df_recs["date"] >= target_start) & (df_recs["date"] <= target_end)
+    target_df = df_recs[mask].sort_values("date")
+    
     if target_df.empty:
         explanation["rule_name"] = "実績不足"
-        explanation["formula"] = "計算に必要な期間のデータがありません"
+        explanation["formula"] = f"{rule_name} の期間の実績が入力されていません"
         return explanation
-        
+    
     total_users = target_df["延べ利用者数"].sum()
     total_days = target_df["開所日数"].sum()
-    if total_days == 0: result = 0.0
+    
+    if total_days == 0:
+        result = 0.0
     else:
         raw_avg = total_users / total_days
         result = ceil_decimal_1(raw_avg)
-        
-    explanation["rule_name"] = rule_text
+    
+    explanation["rule_name"] = rule_name
     explanation["details_df"] = target_df[["年月", "延べ利用者数", "開所日数"]]
-    # 【修正】計算式を日本語で明確化
-    explanation["formula"] = f"延べ利用者数 {total_users}人 ÷ 開所日数 {total_days}日 ＝ 平均利用人数 {result}人 (計算値: {raw_avg:.3f}...)"
+    explanation["formula"] = f"延べ {total_users}人 ÷ 開所 {total_days}日 ＝ 平均利用人数 {result}人 (計算値: {raw_avg:.3f})"
     explanation["result"] = result
+    
     return explanation
 
 def load_data():
@@ -722,7 +741,7 @@ elif menu == "実績・人員計算":
         display_ratio = RATIO_MAP.get(service_ratio, f"{service_ratio}:1")
         st.markdown(f"**必要人員合計 ({display_ratio}): {total_req} 人**")
         
-        # 内訳表示 (st.writeで詳細に)
+        # 内訳表示
         st.write(f"- 平均利用人数 {avg_users}人 ÷ {service_ratio} ＝ {base_staff_raw:.3f}...")
         st.write(f"　→ 切り上げ **{base_staff_req}人** (基礎配置)")
         if wage_staff_req > 0:
@@ -785,14 +804,13 @@ elif menu == "シフト作成":
     start_dt = shift_month.replace(day=1)
     end_dt = start_dt + relativedelta(months=1) - datetime.timedelta(days=1)
     dates = pd.date_range(start_dt, end_dt)
-    jp_days = ["月","火","水","木","金","土","日"]
     date_cols = []; holiday_cols = []
     
     for d in dates:
-        d_label = f"{d.day}({jp_days[d.weekday()]})"
+        d_label = f"{d.day}({JP_DAYS[d.weekday()]})"
         date_cols.append(d_label)
         is_holiday = False
-        wd_str = jp_days[d.weekday()]
+        wd_str = JP_DAYS[d.weekday()]
         if wd_str in closed_days_select: is_holiday = True
         elif close_on_holiday and jpholiday.is_holiday(d.date()): is_holiday = True
         else:
@@ -806,10 +824,10 @@ elif menu == "シフト作成":
             s_name = staff["名前"]
             row_data = {"氏名": s_name}
             for d in dates:
-                d_label = f"{d.day}({jp_days[d.weekday()]})"
+                d_label = f"{d.day}({JP_DAYS[d.weekday()]})"
                 is_closed = (d_label in holiday_cols)
                 if is_closed: row_data[d_label] = "休"
-                elif jp_days[d.weekday()] in staff["固定休"]: row_data[d_label] = "公休"
+                elif JP_DAYS[d.weekday()] in staff["固定休"]: row_data[d_label] = "公休"
                 else: row_data[d_label] = staff["基本シフト"]
             rows.append(row_data)
         new_df = pd.DataFrame(rows)
