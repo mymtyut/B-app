@@ -43,6 +43,7 @@ def load_data_from_sheet(worksheet_name, default_df=None):
             return default_df
         return pd.DataFrame()
 
+# 【修正】保存処理を強化（Numpy型対策、API呼び出し修正）
 def save_data_to_sheet(worksheet_name, df):
     sh = get_spreadsheet()
     try:
@@ -51,20 +52,30 @@ def save_data_to_sheet(worksheet_name, df):
         worksheet = sh.add_worksheet(title=worksheet_name, rows=100, cols=20)
     
     worksheet.clear()
+    
+    # データをリスト化
     params = [df.columns.values.tolist()] + df.values.tolist()
+    
     clean_params = []
     for row in params:
         clean_row = []
         for cell in row:
+            # 1. 日付型 -> 文字列
             if isinstance(cell, (datetime.date, datetime.datetime, datetime.time)):
                 clean_row.append(str(cell))
+            # 2. 空値 (NaN, NaT, None) -> 空文字
             elif pd.isna(cell):
                 clean_row.append("")
+            # 3. Numpy数値型 -> Python標準数値型 (int, float)
+            elif hasattr(cell, "item"): 
+                clean_row.append(cell.item())
+            # 4. その他 -> そのまま
             else:
                 clean_row.append(cell)
         clean_params.append(clean_row)
         
-    worksheet.update(clean_params)
+    # values引数を明示して更新
+    worksheet.update(values=clean_params)
 
 # --- 設定値のJSON変換保存 ---
 def load_settings_from_sheet():
@@ -208,11 +219,10 @@ def load_data():
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
     
-    # 【重要】日付列を安全に変換 (NaNをNoneにする)
+    # 型変換
     df_staff["入社日"] = df_staff["入社日"].apply(safe_to_date)
     df_staff["退職日"] = df_staff["退職日"].apply(safe_to_date)
     
-    # 数値列の変換
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
     if "兼務時間(週)" not in df_staff.columns: df_staff["兼務時間(週)"] = 0.0
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
@@ -279,7 +289,6 @@ def is_special_holiday_recurring(target_date, holiday_df):
 def get_active_staff_df(original_df, settings, target_date_obj=None):
     df = original_df.copy()
     
-    # 【重要】ここでも再度安全な日付変換を行う（フィルタリング処理のため）
     df["入社日"] = df["入社日"].apply(safe_to_date)
     df["退職日"] = df["退職日"].apply(safe_to_date)
 
@@ -453,7 +462,6 @@ with tab1:
         current_list = st.session_state.settings.get(key, [])
         df_hist = pd.DataFrame(current_list)
         
-        # 安全な日付変換
         if "start" not in df_hist.columns: df_hist["start"] = pd.Series(dtype='datetime64[ns]')
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
         
@@ -476,14 +484,11 @@ with tab1:
             res = []
             for _, row in df.iterrows():
                 s, e = row["start"], row["end"]
-                # data_editorからは日付型やTimestamp型が返る可能性がある
                 if not s: continue 
                 
-                # Timestamp -> date
                 if isinstance(s, pd.Timestamp): s = s.date()
                 if isinstance(e, pd.Timestamp): e = e.date()
                 
-                # NaT/None -> None (保存時は空文字に変換される)
                 if pd.isna(s): continue
                 if pd.isna(e): e = None
                 
@@ -664,16 +669,13 @@ with tab3:
         actual_fte = 0.0
         target_roles = ["職業指導員", "生活支援員", "目標工賃達成指導員"]
         details = []
-        
         for _, staff in current_staff_df.iterrows():
             total_hours = staff["契約時間(週)"]
             sub_hours = staff["兼務時間(週)"]
             main_hours = max(0, total_hours - sub_hours)
-            
             staff_target_hours = 0.0
             if staff["職種(主)"] in target_roles: staff_target_hours += main_hours
             if staff["職種(副)"] in target_roles: staff_target_hours += sub_hours
-                
             if staff_target_hours > 0:
                 fte = staff_target_hours / fulltime_weekly_hours
                 if fte > 1.0: fte = 1.0
