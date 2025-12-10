@@ -95,6 +95,7 @@ def load_settings_from_sheet():
                 if k in settings and settings[k]:
                     settings[k] = datetime.datetime.strptime(settings[k], "%H:%M:%S").time()
             
+            # 履歴リストの日付復元
             for hist_key in ["wage_history", "transport_history", "lunch_history", "capacity_history"]:
                 if hist_key in settings:
                     for item in settings[hist_key]:
@@ -146,6 +147,7 @@ def save_settings_to_sheet(settings_dict):
 DEFAULT_SETTINGS = {
     "facility_name": "就労支援センター 未来",
     "opening_date": "2024-11-01",
+    "capacity": 20,
     "open_time": "09:00:00",
     "close_time": "17:00:00",
     "fulltime_hours": 40.0,
@@ -160,6 +162,7 @@ DEFAULT_SETTINGS = {
 }
 
 RATIO_MAP = {6.0: "6:1", 7.5: "7.5:1", 10.0: "10:1"}
+JP_DAYS = ["月","火","水","木","金","土","日"]
 
 def _get_default_settings_obj():
     s = DEFAULT_SETTINGS.copy()
@@ -189,7 +192,6 @@ def is_addon_active(target_date, history_list):
     return False
 
 def get_capacity_at_date(target_date, history_list):
-    """指定された日付時点での定員数を取得"""
     if not history_list: return 20
     sorted_hist = sorted(history_list, key=lambda x: x['start'])
     current_cap = 20
@@ -333,16 +335,30 @@ def load_data():
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
     
-    required_cols = ["名前", "職種(主)", "職種(副)", "雇用形態", "契約時間(週)", "兼務時間(週)", "基本シフト", "固定休", "入社日", "退職日"]
-    for col in required_cols:
-        if col not in df_staff.columns:
-            df_staff[col] = None
+    required_cols_staff = ["名前", "職種(主)", "職種(副)", "雇用形態", "契約時間(週)", "兼務時間(週)", "基本シフト", "固定休", "入社日", "退職日"]
+    for col in required_cols_staff:
+        if col not in df_staff.columns: df_staff[col] = None
 
     df_staff["入社日"] = df_staff["入社日"].apply(safe_to_date)
     df_staff["退職日"] = df_staff["退職日"].apply(safe_to_date)
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
     df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
     data["staff"] = df_staff
+
+    # 利用者マスタ (新規追加)
+    default_users = pd.DataFrame([
+        {"利用者名": "山田太郎", "利用開始日": "2025-01-01", "利用終了日": "", "支給決定量タイプ": "原則日数(月-8)", "固定日数": 0}
+    ])
+    df_users = load_data_from_sheet("users_master", default_users)
+    
+    required_cols_users = ["利用者名", "利用開始日", "利用終了日", "支給決定量タイプ", "固定日数"]
+    for col in required_cols_users:
+        if col not in df_users.columns: df_users[col] = None
+        
+    df_users["利用開始日"] = df_users["利用開始日"].apply(safe_to_date)
+    df_users["利用終了日"] = df_users["利用終了日"].apply(safe_to_date)
+    df_users["固定日数"] = pd.to_numeric(df_users["固定日数"], errors='coerce').fillna(0)
+    data["users"] = df_users
 
     default_patterns = pd.DataFrame([
         {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
@@ -382,6 +398,7 @@ if 'data_loaded' not in st.session_state:
         data = load_data()
         st.session_state.settings = data["settings"]
         st.session_state.staff_db = data["staff"]
+        st.session_state.users_db = data["users"] # 新規
         st.session_state.shift_patterns = data["patterns"]
         st.session_state.special_holidays_list = data["holidays"]
         st.session_state.monthly_records = data["records"]
@@ -395,8 +412,8 @@ year_range = list(range(today.year - 2, today.year + 3))
 st.sidebar.title("メニュー")
 menu = st.sidebar.radio(
     "表示する画面を選択",
-    ["マスタ・休暇設定", "従業員マスタ", "実績・人員計算", "シフト作成"],
-    index=1
+    ["マスタ・休暇設定", "従業員マスタ", "利用者マスタ", "実績・人員計算", "シフト作成"],
+    index=2
 )
 
 st.sidebar.divider()
@@ -409,7 +426,6 @@ with st.sidebar.expander("詳細設定を開く"):
         s_fac_name = st.text_input("事業所名", value=st.session_state.settings["facility_name"])
         s_open_date = st.date_input("開所年月日", value=st.session_state.settings["opening_date"])
         
-        # 定員表示のみ
         current_cap = get_capacity_at_date(today, st.session_state.settings.get('capacity_history', []))
         st.info(f"現在の定員: **{current_cap}名** (履歴管理中)")
         
@@ -444,7 +460,7 @@ closed_days_select = st.session_state.settings["closed_days"]
 close_on_holiday = st.session_state.settings["close_on_holiday"]
 
 # ==========================================
-# メイン画面 (メニュー分岐)
+# メイン画面
 # ==========================================
 
 # ------------------------------------------
@@ -465,14 +481,11 @@ if menu == "マスタ・休暇設定":
             reload_all_data()
 
     st.divider()
-    
-    st.subheader("2. 定員数の変更履歴 (開始日・定員数)")
-    st.caption("定員が増減するタイミングを登録してください。")
+    st.subheader("2. 定員数の変更履歴")
     col_cap1, col_cap2 = st.columns([2, 1])
     with col_cap1:
         curr_cap_hist = st.session_state.settings.get("capacity_history", [])
         df_cap = pd.DataFrame(curr_cap_hist)
-        # 型変換
         if "start" not in df_cap.columns: df_cap["start"] = pd.Series(dtype='datetime64[ns]')
         if "count" not in df_cap.columns: df_cap["count"] = 20
         df_cap["start"] = df_cap["start"].apply(safe_to_date)
@@ -504,21 +517,15 @@ if menu == "マスタ・休暇設定":
             reload_all_data()
 
     st.divider()
-    
-    st.subheader("3. 加算取得期間の設定 (開始・終了)")
-    st.caption("終了日が空欄の場合は「現在も継続中」とみなされます。")
-    
+    st.subheader("3. 加算取得期間の設定")
     col_a1, col_a2, col_a3 = st.columns(3)
-    
     def render_history_editor(key, title):
         current_list = st.session_state.settings.get(key, [])
         df_hist = pd.DataFrame(current_list)
         if "start" not in df_hist.columns: df_hist["start"] = pd.Series(dtype='datetime64[ns]')
         if "end" not in df_hist.columns: df_hist["end"] = pd.Series(dtype='datetime64[ns]')
-        
         df_hist["start"] = df_hist["start"].apply(safe_to_date)
         df_hist["end"] = df_hist["end"].apply(safe_to_date)
-        
         column_cfg = {
             "start": st.column_config.DateColumn("開始日", required=True),
             "end": st.column_config.DateColumn("終了日"),
@@ -554,7 +561,6 @@ if menu == "マスタ・休暇設定":
         reload_all_data()
 
     st.divider()
-
     st.subheader("4. 毎年繰り返す特別休暇")
     c_h1, c_h2 = st.columns([2, 1])
     with c_h1:
@@ -578,7 +584,6 @@ if menu == "マスタ・休暇設定":
 # ------------------------------------------
 elif menu == "従業員マスタ":
     st.header("👥 従業員マスタ")
-    st.info("※「兼務時間」に入力した時間は、主たる職種の時間から差し引かれ、従たる職種の時間として計算されます。")
     
     active_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=None)
     shift_codes = st.session_state.shift_patterns["コード"].tolist() if not st.session_state.shift_patterns.empty else []
@@ -608,6 +613,47 @@ elif menu == "従業員マスタ":
         reload_all_data()
 
 # ------------------------------------------
+# 画面2.5: 利用者マスタ (新規)
+# ------------------------------------------
+elif menu == "利用者マスタ":
+    st.header("🧑‍🤝‍🧑 利用者マスタ")
+    st.markdown("利用者の契約情報（支給決定量など）を管理します。")
+    
+    df_users = st.session_state.users_db.copy()
+    
+    # 列設定
+    user_col_config = {
+        "利用者名": st.column_config.TextColumn("氏名", required=True),
+        "利用開始日": st.column_config.DateColumn("利用開始日", required=True),
+        "利用終了日": st.column_config.DateColumn("利用終了日"),
+        "支給決定量タイプ": st.column_config.SelectboxColumn(
+            "支給決定量",
+            options=["原則日数(月-8)", "固定日数"],
+            required=True,
+            help="原則日数を選ぶと『その月の日数-8日』で自動計算されます。"
+        ),
+        "固定日数": st.column_config.NumberColumn(
+            "固定日数(日)", 
+            min_value=0, max_value=31, step=1,
+            help="タイプが『固定日数』の場合のみ使用されます。"
+        )
+    }
+    
+    edited_users_df = st.data_editor(
+        df_users, 
+        column_config=user_col_config, 
+        num_rows="dynamic", 
+        use_container_width=True, 
+        key="users_editor"
+    )
+    
+    if st.button("利用者情報を保存", type="primary"):
+        st.session_state.users_db = edited_users_df
+        save_data_to_sheet("users_master", edited_users_df)
+        st.success("保存しました")
+        reload_all_data()
+
+# ------------------------------------------
 # 画面3: 実績・人員計算
 # ------------------------------------------
 elif menu == "実績・人員計算":
@@ -619,39 +665,86 @@ elif menu == "実績・人員計算":
         s_month_rec = st.selectbox("対象月", list(range(1, 13)), index=today.month - 1)
         target_ym = f"{s_year_rec}年{s_month_rec}月"
         st.caption(f"登録データ名: **{target_ym}**")
-        users_input = st.number_input("延べ利用者数", min_value=0, value=400)
         
-        # 2. 定員超過減算チェック（入力と連動）
+        # --- 自動計算機能の追加 ---
+        st.markdown("---")
+        st.write("🧑‍🤝‍🧑 **利用者マスタから計算**")
+        if st.button("自動集計して入力"):
+            # ロジック: 対象月の利用者ごとの日数を計算して合計する
+            calc_start = datetime.date(s_year_rec, s_month_rec, 1)
+            calc_last_day = calendar.monthrange(s_year_rec, s_month_rec)[1]
+            calc_end = datetime.date(s_year_rec, s_month_rec, calc_last_day)
+            
+            # 原則日数 (月-8)
+            principle_days = calc_last_day - 8
+            
+            total_calc_users = 0
+            details_log = []
+            
+            users_df = st.session_state.users_db
+            
+            for _, u in users_df.iterrows():
+                # 1. 在籍判定
+                start = u["利用開始日"]
+                end = u["利用終了日"]
+                
+                # データなしならスキップ
+                if not start: continue
+                
+                # 開始日が月末より後ならまだ
+                if start > calc_end: continue
+                # 終了日が月初より前ならもういない
+                if end and end < calc_start: continue
+                
+                # 2. 日数決定
+                u_days = 0
+                if u["支給決定量タイプ"] == "原則日数(月-8)":
+                    u_days = principle_days
+                else:
+                    u_days = int(u["固定日数"]) if pd.notnull(u["固定日数"]) else 0
+                
+                # 途中入退所の日割計算が必要ならここに入れるが、要件では「原則日数」なので単純化
+                # (例: 1/15入所でも23日とするか、実日数で計算するか。要件「1月1日利用開始...自動で23日」に従う)
+                
+                total_calc_users += u_days
+                details_log.append(f"{u['利用者名']}: {u_days}日")
+                
+            st.session_state["temp_users_input"] = total_calc_users
+            st.success(f"計算完了: 合計 {total_calc_users}日")
+            with st.expander("内訳を表示"):
+                st.write(details_log)
+        
+        # 入力欄 (セッションステートに値があればそれをデフォルトに)
+        default_val = 400
+        if "temp_users_input" in st.session_state:
+            default_val = int(st.session_state["temp_users_input"])
+            
+        users_input = st.number_input("延べ利用者数", min_value=0, value=default_val)
+        
+        # 定員超過減算チェック
         start_date = datetime.date(s_year_rec, s_month_rec, 1)
         last_day = calendar.monthrange(s_year_rec, s_month_rec)[1]
         
-        # 開所日数の仮計算（休日設定に基づく）
         temp_open_days = 0
         for d_int in range(1, last_day + 1):
             curr = datetime.date(s_year_rec, s_month_rec, d_int)
-            wd = jp_days[curr.weekday()]
+            wd = JP_DAYS[curr.weekday()]
             if wd not in closed_days_select and not (close_on_holiday and jpholiday.is_holiday(curr)):
                 if not is_special_holiday_recurring(curr, st.session_state.special_holidays_list)[0]:
                     temp_open_days += 1
         
-        # 警告表示
         current_cap = get_capacity_at_date(start_date, st.session_state.settings.get('capacity_history', []))
         
         # 3ヶ月平均超過チェック
-        # (ここでは簡易的に、直近2ヶ月の実績＋今の入力値でシミュレーション)
         df_recs = st.session_state.monthly_records.copy()
         df_recs["date"] = pd.to_datetime(df_recs["年月"].astype(str).str.replace("年", "-").str.replace("月", "-01")).dt.date
-        
         prev1 = start_date - relativedelta(months=1)
         prev2 = start_date - relativedelta(months=2)
-        
-        # 過去データ取得
         rec_prev1 = df_recs[df_recs["date"] == prev1]
         rec_prev2 = df_recs[df_recs["date"] == prev2]
         
         sum_users = users_input
         sum_days = temp_open_days
-        
         if not rec_prev1.empty:
             sum_users += rec_prev1.iloc[0]["延べ利用者数"]
             sum_days += rec_prev1.iloc[0]["開所日数"]
@@ -663,14 +756,12 @@ elif menu == "実績・人員計算":
             avg_3m = sum_users / sum_days
             limit_125 = current_cap * 1.25
             if avg_3m > limit_125:
-                st.error(f"⚠️ 直近3ヶ月平均利用人数({avg_3m:.1f}人)が、定員{current_cap}名の125%({limit_125:.1f}人)を超過しています。減算対象の可能性があります。")
+                st.error(f"⚠️ 直近3ヶ月平均利用人数({avg_3m:.1f}人)が、定員{current_cap}名の125%({limit_125:.1f}人)を超過しています。")
         
-        # 1日平均超過リスクチェック
         if temp_open_days > 0:
             daily_avg = users_input / temp_open_days
-            # 平均が定員の120%を超えていたら、特定の日に150%超えのリスクありとみなす（ヒューリスティック）
             if daily_avg > current_cap * 1.2:
-                st.error(f"⚠️ 今月の平均利用率が{daily_avg/current_cap:.0%}です。特定の日が定員の150%({int(current_cap*1.5)}人)を超えている可能性があります。日々の記録を確認してください。")
+                st.error(f"⚠️ 今月の平均利用率が{daily_avg/current_cap:.0%}です。特定の日が150%超過の可能性があります。")
 
     with col_in2:
         st.metric("自動計算された開所日数", f"{temp_open_days} 日")
@@ -682,6 +773,8 @@ elif menu == "実績・人員計算":
             st.session_state.monthly_records = pd.concat([df_recs, pd.DataFrame([new_row])], ignore_index=True)
             save_data_to_sheet("monthly_records", st.session_state.monthly_records)
             st.success(f"{target_ym} の実績を保存しました")
+            if "temp_users_input" in st.session_state:
+                del st.session_state["temp_users_input"]
             reload_all_data()
 
     st.divider()
@@ -696,7 +789,6 @@ elif menu == "実績・人員計算":
         
     calc_target_date = datetime.date(c_year_calc, c_month_calc, 1)
     
-    # --- 加算要件チェック（期間 & スタッフ） ---
     warning_messages = []
     sets = st.session_state.settings
     
@@ -722,7 +814,6 @@ elif menu == "実績・人員計算":
     else:
         st.success("✅ 加算要件に対する職種配置はOKです")
 
-    # 計算実行
     calc_result = calculate_average_users_detail(
         calc_target_date, 
         st.session_state.settings["opening_date"], 
