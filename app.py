@@ -74,10 +74,20 @@ def load_settings_from_sheet():
         val = ws.acell('A1').value
         if val:
             settings = json.loads(val)
-            settings["opening_date"] = datetime.datetime.strptime(settings["opening_date"], "%Y-%m-%d").date()
-            settings["open_time"] = datetime.datetime.strptime(settings["open_time"], "%H:%M:%S").time()
-            settings["close_time"] = datetime.datetime.strptime(settings["close_time"], "%H:%M:%S").time()
-            if "service_ratio" not in settings: settings["service_ratio"] = 6.0 
+            keys_to_date = ["opening_date", "wage_start", "transport_start", "lunch_start"]
+            keys_to_time = ["open_time", "close_time"]
+            
+            for k in keys_to_date:
+                if k in settings and settings[k]:
+                    settings[k] = datetime.datetime.strptime(settings[k], "%Y-%m-%d").date()
+            
+            for k in keys_to_time:
+                if k in settings and settings[k]:
+                    settings[k] = datetime.datetime.strptime(settings[k], "%H:%M:%S").time()
+            
+            defaults = _get_default_settings_obj()
+            for k, v in defaults.items():
+                if k not in settings: settings[k] = v
             return settings
     except (gspread.WorksheetNotFound, json.JSONDecodeError, TypeError):
         pass
@@ -85,13 +95,10 @@ def load_settings_from_sheet():
 
 def save_settings_to_sheet(settings_dict):
     s_save = settings_dict.copy()
-    if isinstance(s_save["opening_date"], datetime.date):
-        s_save["opening_date"] = s_save["opening_date"].strftime("%Y-%m-%d")
-    if isinstance(s_save["open_time"], datetime.time):
-        s_save["open_time"] = s_save["open_time"].strftime("%H:%M:%S")
-    if isinstance(s_save["close_time"], datetime.time):
-        s_save["close_time"] = s_save["close_time"].strftime("%H:%M:%S")
-    
+    for k, v in s_save.items():
+        if isinstance(v, (datetime.date, datetime.time)):
+            fmt = "%H:%M:%S" if isinstance(v, datetime.time) else "%Y-%m-%d"
+            s_save[k] = v.strftime(fmt)
     json_str = json.dumps(s_save, ensure_ascii=False)
     
     sh = get_spreadsheet()
@@ -99,7 +106,6 @@ def save_settings_to_sheet(settings_dict):
         ws = sh.worksheet("settings")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="settings", rows=10, cols=10)
-    
     ws.update_acell('A1', json_str)
 
 # ==========================================
@@ -113,52 +119,50 @@ DEFAULT_SETTINGS = {
     "open_time": "09:00:00",
     "close_time": "17:00:00",
     "fulltime_hours": 40.0,
-    "add_ons": ["目標工賃達成指導員加算", "送迎加算"],
     "service_ratio": 6.0, 
     "closed_days": ["土", "日"],
-    "close_on_holiday": True
+    "close_on_holiday": True,
+    "wage_flag": True, "wage_start": "2024-11-01",
+    "transport_flag": True, "transport_start": "2024-11-01",
+    "lunch_flag": False, "lunch_start": "2024-11-01",
+    "add_ons": [] 
 }
 
 RATIO_MAP = {6.0: "6:1", 7.5: "7.5:1", 10.0: "10:1"}
 
 def _get_default_settings_obj():
     s = DEFAULT_SETTINGS.copy()
-    s["opening_date"] = datetime.datetime.strptime(s["opening_date"], "%Y-%m-%d").date()
-    s["open_time"] = datetime.datetime.strptime(s["open_time"], "%H:%M:%S").time()
-    s["close_time"] = datetime.datetime.strptime(s["close_time"], "%H:%M:%S").time()
+    for k in ["opening_date", "wage_start", "transport_start", "lunch_start"]:
+        if isinstance(s[k], str): s[k] = datetime.datetime.strptime(s[k], "%Y-%m-%d").date()
+    for k in ["open_time", "close_time"]:
+        if isinstance(s[k], str): s[k] = datetime.datetime.strptime(s[k], "%H:%M:%S").time()
     return s
 
 def ceil_decimal_1(value):
     return math.ceil(value * 10) / 10
 
 def load_data():
-    """全データをスプレッドシートから読み込む"""
     data = {}
-    
-    # 1. 設定
     data["settings"] = load_settings_from_sheet()
 
-    # 2. スタッフ
+    # スタッフマスタ（兼務時間を追加）
     default_staff = pd.DataFrame([
-        {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
-        {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
-        {"名前": "指導員C", "職種(主)": "職業指導員", "職種(副)": "運転手", "雇用形態": "常勤", "契約時間(週)": 40.0, "基本シフト": "A", "固定休": "日,月", "入社日": "2024-04-01", "退職日": ""},
-        {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "管理者A", "職種(主)": "管理者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "兼務時間(週)": 0.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "サビ管B", "職種(主)": "サービス管理責任者", "職種(副)": "なし", "雇用形態": "常勤", "契約時間(週)": 40.0, "兼務時間(週)": 0.0, "基本シフト": "A", "固定休": "土,日", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "指導員C", "職種(主)": "職業指導員", "職種(副)": "運転手", "雇用形態": "常勤", "契約時間(週)": 40.0, "兼務時間(週)": 5.0, "基本シフト": "A", "固定休": "日,月", "入社日": "2024-04-01", "退職日": ""},
+        {"名前": "支援員D", "職種(主)": "生活支援員", "職種(副)": "調理員", "雇用形態": "非常勤", "契約時間(週)": 20.0, "兼務時間(週)": 0.0, "基本シフト": "午", "固定休": "火,木,土,日", "入社日": "2024-04-01", "退職日": ""},
     ])
     df_staff = load_data_from_sheet("staff_master", default_staff)
-    
-    # --- 型変換処理 (重要) ---
-    # 日付変換
     df_staff["入社日"] = pd.to_datetime(df_staff["入社日"]).dt.date
     df_staff["退職日"] = pd.to_datetime(df_staff["退職日"], errors='coerce').dt.date
-    
-    # 数値変換 (契約時間を強制的にfloatにする)
-    # これがないとスプレッドシートの文字データとして扱われ、入力ロックされる
     df_staff["契約時間(週)"] = pd.to_numeric(df_staff["契約時間(週)"], errors='coerce').fillna(0.0)
+    # 兼務時間がなければ追加
+    if "兼務時間(週)" not in df_staff.columns:
+        df_staff["兼務時間(週)"] = 0.0
+    df_staff["兼務時間(週)"] = pd.to_numeric(df_staff["兼務時間(週)"], errors='coerce').fillna(0.0)
     
     data["staff"] = df_staff
 
-    # 3. 勤務区分
     default_patterns = pd.DataFrame([
         {"コード": "A", "名称": "日勤A", "開始": "09:00:00", "終了": "16:00:00", "休憩(分)": 60},
         {"コード": "B", "名称": "日勤B", "開始": "09:00:00", "終了": "17:00:00", "休憩(分)": 60},
@@ -170,18 +174,15 @@ def load_data():
     df_ptn["終了"] = pd.to_datetime(df_ptn["終了"], format='%H:%M:%S').dt.time
     data["patterns"] = df_ptn
 
-    # 4. 休日
     default_holidays = pd.DataFrame([
         {"名称": "年末年始", "開始月": 12, "開始日": 29, "終了月": 1, "終了日": 3},
         {"名称": "夏季休暇", "開始月": 8,  "開始日": 13, "終了月": 8, "終了日": 15},
     ])
     data["holidays"] = load_data_from_sheet("holidays", default_holidays)
 
-    # 5. 実績
     default_records = pd.DataFrame(columns=["年月", "延べ利用者数", "開所日数"])
     data["records"] = load_data_from_sheet("monthly_records", default_records)
 
-    # 6. ドラフトシフト
     data["draft_shift"] = load_data_from_sheet("current_shift_draft", pd.DataFrame())
     if data["draft_shift"].empty:
         data["draft_shift"] = None 
@@ -219,12 +220,11 @@ def is_special_holiday_recurring(target_date, holiday_df):
         except ValueError: continue
     return False, ""
 
-def get_active_staff_df(original_df, selected_addons, target_date_obj=None):
+def get_active_staff_df(original_df, settings, target_date_obj=None):
     df = original_df.copy()
     if target_date_obj:
         last_day = calendar.monthrange(target_date_obj.year, target_date_obj.month)[1]
         month_end = datetime.date(target_date_obj.year, target_date_obj.month, last_day)
-        
         df["入社日"] = pd.to_datetime(df["入社日"]).dt.date
         df["退職日"] = pd.to_datetime(df["退職日"]).dt.date
         
@@ -239,12 +239,8 @@ def get_active_staff_df(original_df, selected_addons, target_date_obj=None):
             active_mask.append(is_hired and not is_resigned)
         df = df[active_mask]
 
-    exclude_targets = []
-    if "目標工賃達成指導員加算" not in selected_addons: exclude_targets.append("目標工賃達成指導員")
-    if "食事提供加算" not in selected_addons: exclude_targets.append("調理員")
-    if "送迎加算" not in selected_addons: exclude_targets.append("運転手")
-    if exclude_targets:
-        df = df[~df["職種(主)"].isin(exclude_targets)]
+    # ここでは職種フィルタは行わない（マスタでは全員見たい、シフト作成時は計算ロジックで制御）
+    # ただしシフト作成画面での表示のために一応返す
     return df
 
 def calculate_average_users_detail(target_date, opening_date, capacity, records_df):
@@ -335,8 +331,15 @@ with st.sidebar.form("settings_form"):
     s_close_time = st.time_input("営業終了", value=st.session_state.settings["close_time"])
     s_fulltime = st.number_input("常勤時間(週)", value=st.session_state.settings["fulltime_hours"], step=0.5)
     
-    st.subheader("取得加算")
-    s_addons = st.multiselect("取得中の加算", ["目標工賃達成指導員加算", "食事提供加算", "送迎加算"], default=st.session_state.settings["add_ons"])
+    st.subheader("取得加算と開始時期")
+    s_wage_flag = st.checkbox("目標工賃達成指導員加算", value=st.session_state.settings.get("wage_flag", False))
+    s_wage_start = st.date_input("開始年月 (目標工賃)", value=st.session_state.settings.get("wage_start", today)) if s_wage_flag else today
+    
+    s_trans_flag = st.checkbox("送迎加算", value=st.session_state.settings.get("transport_flag", False))
+    s_trans_start = st.date_input("開始年月 (送迎)", value=st.session_state.settings.get("transport_start", today)) if s_trans_flag else today
+    
+    s_lunch_flag = st.checkbox("食事提供加算", value=st.session_state.settings.get("lunch_flag", False))
+    s_lunch_start = st.date_input("開始年月 (食事)", value=st.session_state.settings.get("lunch_start", today)) if s_lunch_flag else today
     
     st.subheader("定休日設定")
     s_closed_days = st.multiselect("曜日定休", ["月", "火", "水", "木", "金", "土", "日"], default=st.session_state.settings["closed_days"])
@@ -346,8 +349,12 @@ with st.sidebar.form("settings_form"):
         new_settings = {
             "facility_name": s_fac_name, "opening_date": s_open_date, "capacity": s_capacity,
             "open_time": s_open_time, "close_time": s_close_time, "fulltime_hours": s_fulltime,
-            "add_ons": s_addons, "closed_days": s_closed_days, "close_on_holiday": s_close_holiday,
-            "service_ratio": s_ratio_val
+            "add_ons": st.session_state.settings["add_ons"], # ダミー
+            "closed_days": s_closed_days, "close_on_holiday": s_close_holiday,
+            "service_ratio": s_ratio_val,
+            "wage_flag": s_wage_flag, "wage_start": s_wage_start,
+            "transport_flag": s_trans_flag, "transport_start": s_trans_start,
+            "lunch_flag": s_lunch_flag, "lunch_start": s_lunch_start
         }
         st.session_state.settings = new_settings
         save_settings_to_sheet(new_settings)
@@ -355,11 +362,10 @@ with st.sidebar.form("settings_form"):
         st.rerun()
 
 # 変数展開
-add_ons = st.session_state.settings["add_ons"]
-closed_days_select = st.session_state.settings["closed_days"]
-close_on_holiday = st.session_state.settings["close_on_holiday"]
 fulltime_weekly_hours = st.session_state.settings["fulltime_hours"]
 service_ratio = st.session_state.settings.get("service_ratio", 6.0)
+closed_days_select = st.session_state.settings["closed_days"]
+close_on_holiday = st.session_state.settings["close_on_holiday"]
 
 # --- メインエリア ---
 tab1, tab2, tab3, tab4 = st.tabs(["🛠️ マスタ・休暇", "👥 従業員マスタ", "📅 実績・人員計算", "📝 シフト作成"])
@@ -399,7 +405,9 @@ with tab1:
 # ------------------------------------------
 with tab2:
     st.header("👥 従業員詳細設定")
-    active_staff_df = get_active_staff_df(st.session_state.staff_db, add_ons, target_date_obj=None)
+    st.info("※「兼務時間」に入力した時間は、主たる職種の時間から差し引かれ、従たる職種の時間として計算されます。")
+    
+    active_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=None)
     shift_codes = st.session_state.shift_patterns["コード"].tolist() if not st.session_state.shift_patterns.empty else []
     job_options = ["管理者", "サービス管理責任者", "職業指導員", "生活支援員", "目標工賃達成指導員", "調理員", "運転手", "事務員", "看護職員", "なし"]
 
@@ -408,8 +416,8 @@ with tab2:
         "職種(副)": st.column_config.SelectboxColumn("職種(副)", options=job_options, required=False),
         "雇用形態": st.column_config.SelectboxColumn("雇用形態", options=["常勤", "非常勤"], required=True),
         "基本シフト": st.column_config.SelectboxColumn("基本シフト", options=shift_codes, required=True),
-        # 【修正】step=0.5を追加して0.5単位入力を可能に
         "契約時間(週)": st.column_config.NumberColumn("契約時間(週)", format="%.1f h", step=0.5),
+        "兼務時間(週)": st.column_config.NumberColumn("兼務時間(週)", format="%.1f h", step=0.5, help="職種(副)に従事する時間"),
         "入社日": st.column_config.DateColumn("入社日", required=True),
         "退職日": st.column_config.DateColumn("退職日"),
     }
@@ -477,6 +485,32 @@ with tab3:
         
     calc_target_date = datetime.date(c_year_calc, c_month_calc, 1)
     
+    # --- 加算要件チェック (兼務含む) ---
+    warning_messages = []
+    sets = st.session_state.settings
+    
+    def check_addon_period(flag, start_date, roles, name):
+        if flag and calc_target_date >= start_date.replace(day=1):
+            valid_staff = get_active_staff_df(st.session_state.staff_db, sets, target_date_obj=calc_target_date)
+            # 在籍していて、かつその役割を持っているか（主または副）
+            has_role = False
+            for _, r in valid_staff.iterrows():
+                if r["職種(主)"] in roles or r["職種(副)"] in roles:
+                    has_role = True
+                    break
+            if not has_role:
+                warning_messages.append(f"⚠️ {name}を取得中（{start_date}開始）ですが、{calc_target_date.strftime('%Y年%m月')}時点で有効な『{'・'.join(roles)}』がマスタに存在しません。")
+
+    check_addon_period(sets.get("wage_flag"), sets.get("wage_start"), ["目標工賃達成指導員"], "目標工賃達成指導員加算")
+    check_addon_period(sets.get("transport_flag"), sets.get("transport_start"), ["運転手"], "送迎加算")
+    check_addon_period(sets.get("lunch_flag"), sets.get("lunch_start"), ["調理員"], "食事提供加算")
+
+    if warning_messages:
+        for msg in warning_messages: st.error(msg)
+    else:
+        st.success("✅ 加算要件に対する職種配置はOKです")
+
+    # 計算実行
     calc_result = calculate_average_users_detail(
         calc_target_date, 
         st.session_state.settings["opening_date"], 
@@ -498,34 +532,62 @@ with tab3:
 
     with c_res2:
         base_staff = avg_users / service_ratio
+        
+        # 目標工賃達成指導員加算がある場合は +1.0
         add_staff = 0.0
-        if "目標工賃達成指導員加算" in add_ons: add_staff = 1.0
+        if sets.get("wage_flag") and calc_target_date >= sets.get("wage_start").replace(day=1):
+            add_staff = 1.0
+            
         required_staff = ceil_decimal_1(base_staff + add_staff)
         display_ratio = RATIO_MAP.get(service_ratio, f"{service_ratio}:1")
         st.metric(f"必要人員合計 ({display_ratio})", f"{required_staff} 人", help=f"基準配置 {base_staff:.2f} + 加算配置 {add_staff} (端数切り上げ)")
         
-        st.markdown("**現在のマスタと照合**")
-        current_staff_df = get_active_staff_df(st.session_state.staff_db, add_ons, target_date_obj=calc_target_date)
+        st.markdown("**現在のマスタと照合（兼務考慮）**")
+        current_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=calc_target_date)
+        
         actual_fte = 0.0
-        exclude_roles = ["管理者", "サービス管理責任者", "事務員", "運転手", "調理員", "看護職員"]
+        
+        # 配置基準（職業指導員・生活支援員）としてカウントする対象職種
+        # ※目標工賃達成指導員も、加算で+1要求される分、カウント対象に含めるのが一般的（自治体によるが）
+        # ここではシンプルに「指導員・支援員」＋「目標工賃担当」をカウント対象とする
+        target_roles = ["職業指導員", "生活支援員", "目標工賃達成指導員"]
+        
+        details = []
+        
         for _, staff in current_staff_df.iterrows():
-            role = staff["職種(主)"]
-            if role not in exclude_roles:
-                week_hours = staff["契約時間(週)"]
+            total_hours = staff["契約時間(週)"]
+            sub_hours = staff["兼務時間(週)"]
+            
+            # 主業務の時間 = 全体 - 兼務
+            main_hours = max(0, total_hours - sub_hours)
+            
+            # 加算用の一時変数
+            staff_target_hours = 0.0
+            
+            # 主職種がターゲットなら加算
+            if staff["職種(主)"] in target_roles:
+                staff_target_hours += main_hours
                 
-                # 安全にfloat変換
-                try:
-                    week_hours = float(week_hours)
-                except (ValueError, TypeError):
-                    week_hours = 0.0
+            # 副職種がターゲットなら加算
+            if staff["職種(副)"] in target_roles:
+                staff_target_hours += sub_hours
                 
-                fte = week_hours / fulltime_weekly_hours
+            if staff_target_hours > 0:
+                fte = staff_target_hours / fulltime_weekly_hours
                 if fte > 1.0: fte = 1.0
                 actual_fte += fte
+                details.append(f"{staff['名前']}: {fte:.2f} (対象 {staff_target_hours}h)")
+
         actual_fte = round(actual_fte, 1)
         st.metric("配置可能人員", f"{actual_fte} 人")
-        if actual_fte >= required_staff: st.success("✅ 充足")
-        else: st.error(f"❌ 不足 {round(required_staff - actual_fte, 1)}人")
+        
+        if actual_fte >= required_staff:
+            st.success("✅ 充足")
+        else:
+            st.error(f"❌ 不足 {round(required_staff - actual_fte, 1)}人")
+            
+        with st.expander("内訳（兼務考慮済）"):
+            for d in details: st.write(f"- {d}")
 
 # ------------------------------------------
 # TAB 4: シフト作成
@@ -541,7 +603,7 @@ with tab4:
         
     shift_month = datetime.date(s_year_shift, s_month_shift, 1)
     
-    shift_staff_df = get_active_staff_df(st.session_state.staff_db, add_ons, target_date_obj=shift_month)
+    shift_staff_df = get_active_staff_df(st.session_state.staff_db, st.session_state.settings, target_date_obj=shift_month)
     shift_staff_names = shift_staff_df["名前"].tolist()
     
     shift_opts = st.session_state.shift_patterns["コード"].tolist() + ["休", "公休", "有給"]
